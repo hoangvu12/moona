@@ -1,0 +1,11 @@
+# Build artifacts
+moona.exe
+moona.exe~
+*.exe
+*.exe~
+
+# Logs / scratch
+*.log
+
+# Tool caches
+.mimir/
