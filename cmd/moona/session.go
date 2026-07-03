@@ -34,6 +34,11 @@ type wsMessage struct {
 	// Enc marks how Data is encoded when it is not a plain UTF-8 terminal string.
 	// Used by the {type:"replay"} history frame, whose Data is base64(gzip(bytes)).
 	Enc string `json:"enc,omitempty"`
+	// Active carries a browser client's focus state on a {type:"active"} frame:
+	// true when the user is looking at that tab (document visible), false when it
+	// is backgrounded. A focused browser becomes the ConPTY size authority so the
+	// terminal follows whichever screen you're actually using. See setActive.
+	Active bool `json:"active,omitempty"`
 	// Sessions carries the daemon's current session list on a {type:"sessions"}
 	// frame, so browsers refresh their tab bar from a push instead of polling.
 	Sessions []sessionInfo `json:"sessions,omitempty"`
@@ -51,6 +56,14 @@ type client struct {
 	// size AUTHORITY: the ConPTY tracks it, and browsers conform to it. Browser
 	// clients (primary=false) never shrink the ConPTY; they letterbox/scroll.
 	primary bool
+	// active marks a browser client the user is currently looking at (its tab is
+	// visible/focused). A single PTY can only hold one size, so the ConPTY can't
+	// be both phone-narrow and desktop-wide at once; instead it FOLLOWS focus — a
+	// focused browser outranks even a primary native terminal as the size
+	// authority, so the terminal fits whichever screen you've switched to. When no
+	// browser is focused, authority reverts to the native terminal. Set via the
+	// {type:"active"} frame; only meaningful for browser (non-primary) clients.
+	active bool
 }
 
 type session struct {
@@ -283,25 +296,80 @@ func (s *session) effectiveSizeBroadcastLocked(cols, rows int) ([]byte, []*clien
 	return mustJSON(wsMessage{Type: "size", Cols: cols, Rows: rows}), clients
 }
 
-// minClientSizeLocked returns the smallest cols/rows across all clients that
-// have reported a size. The phone browser and the desktop terminal share one
-// ConPTY, which can only hold a single size; sizing it to the minimum keeps the
-// entire logical screen visible on every client (tmux's default policy) instead
-// of letting the last resize win and garbling the larger client's TUI. Clients
-// that have not reported a size yet (cols/rows 0) are ignored. Caller holds s.mu.
+// minClientSizeLocked returns the cols/rows the shared ConPTY should hold, given
+// that it can only be ONE size for every attached client. Authority is decided by
+// FOCUS, so the terminal follows whichever screen the user is actually on:
+//
+//  1. If any browser is focused (active), the ConPTY tracks the focused
+//     browser(s) — even over a native terminal. This is what lets the phone shrink
+//     the grid to a readable width while you're using it; Claude Code reflows
+//     cleanly on the width change (its one guaranteed-clean repaint case).
+//  2. Otherwise a native terminal (primary) is authority: it CANNOT be resized by
+//     moona, so when you're not looking at any browser the ConPTY snaps back to
+//     the native terminal's size and it renders cleanly again.
+//  3. Otherwise browsers drive the size (phone-only use, nothing to obey).
+//
+// Within a tier we take the smallest reported size so every client in that tier
+// stays within the ConPTY. Clients with no reported size (cols/rows 0) are
+// ignored. Caller holds s.mu.
 func (s *session) minClientSizeLocked() (int, int) {
-	// A native terminal (primary) cannot be resized by moona, so if any is
-	// attached it is the size AUTHORITY: the ConPTY tracks the primaries and
-	// browser sizes are ignored entirely (browsers conform + scroll/zoom, never
-	// shrink the ConPTY). This keeps the original terminal's grid fixed no matter
-	// what device connects. With several primaries we take the smallest so every
-	// native terminal stays within the ConPTY. Only when NO primary is present do
-	// browsers drive the size (phone-only use, where there is nothing to obey).
+	if cols, rows := s.minActiveBrowserSizeLocked(); cols > 0 && rows > 0 {
+		return cols, rows
+	}
 	cols, rows := s.minSizeLocked(true)
 	if cols > 0 && rows > 0 {
 		return cols, rows
 	}
 	return s.minSizeLocked(false)
+}
+
+// minActiveBrowserSizeLocked returns the smallest reported size across browser
+// clients that are currently focused (active). Native (primary) clients never
+// count — they don't report focus and can't be resized anyway. Returns 0,0 when
+// no focused browser has reported a size. Caller holds s.mu.
+func (s *session) minActiveBrowserSizeLocked() (int, int) {
+	cols, rows := 0, 0
+	for cl := range s.clients {
+		if cl.primary || !cl.active {
+			continue
+		}
+		if cl.cols <= 0 || cl.rows <= 0 {
+			continue
+		}
+		if cols == 0 || cl.cols < cols {
+			cols = cl.cols
+		}
+		if rows == 0 || cl.rows < rows {
+			rows = cl.rows
+		}
+	}
+	return cols, rows
+}
+
+// setActive records a browser client's focus state and, because focus can change
+// which client is the size authority, recomputes the effective ConPTY size the
+// same way resize() does — resizing the pseudoconsole and broadcasting the new
+// size so every client conforms. Focusing the phone shrinks the ConPTY to fit it;
+// backgrounding it hands authority back to the native terminal (or another
+// focused browser).
+func (s *session) setActive(c *client, active bool) error {
+	s.mu.Lock()
+	c.active = active
+	pty := s.pty
+	running := s.running
+	effCols, effRows := s.minClientSizeLocked()
+	msg, clients := s.effectiveSizeBroadcastLocked(effCols, effRows)
+	s.mu.Unlock()
+	if !running || pty == nil || effCols <= 0 || effRows <= 0 {
+		return nil
+	}
+	if err := pty.Resize(effCols, effRows); err != nil {
+		return err
+	}
+	for _, cl := range clients {
+		cl.queue(msg)
+	}
+	return nil
 }
 
 // minSizeLocked returns the smallest reported size across clients. When

@@ -374,25 +374,54 @@
       lastReqRows = dims.rows;
       send({ type: 'resize', cols: dims.cols, rows: dims.rows });
     }
-    // On phones the grid is pinned to the (often larger) native-terminal size,
-    // so at a normal font it overflows and the bottom row hides behind the
-    // keyboard. Shrink the font just enough that the whole authoritative grid
-    // fits the visible area — never larger than a readable default.
-    const IS_MOBILE = matchMedia('(pointer: coarse)').matches;
-    const MOBILE_MAX_FONT = window.innerWidth < 640 ? 13 : 14;
+    // The grid is pinned to the authoritative native-terminal size (often narrower
+    // AND shorter than a desktop browser window, or wider than a phone). We can't
+    // change cols/rows (the grid MUST stay == the ConPTY or Claude Code's
+    // cursor-relative frames rot — see the size handler), so instead we scale the
+    // FONT to make the whole authoritative grid fill the available space. Fitting
+    // the font — rather than CSS-scaling the canvas — keeps the text crisp at any
+    // size. This runs on every browser client (desktop + mobile); a native
+    // `moona attach` client is the size AUTHORITY and never runs this.
+    //
+    // Fit policy: grow the font to fill the full WIDTH of the viewport, but never
+    // let the grid grow TALLER than the viewport, so the bottom row (the live
+    // prompt / input) always stays visible. With a fixed grid that's a single
+    // letterbox fit — take the font size that fills the width and the one that
+    // fills the height, and use the smaller. Whichever axis is tighter binds; the
+    // other gets a little slack (empty margin), which is unavoidable with a fixed
+    // aspect ratio.
+    const MAX_FONT = 64; // sanity ceiling so a tiny grid can't blow the font up absurdly
+    const MIN_FILL_FONT = 9; // below this, filling the width is unreadable -> pan instead
     function fitFontToGrid() {
-      if (!IS_MOBILE || !lastEffCols || !lastEffRows) return;
+      if (!lastEffCols || !lastEffRows) return;
       const wrap = document.getElementById('terminal-wrap');
-      const h = wrap.clientHeight;
-      if (h < 20) return;
+      const w = wrap.clientWidth, h = wrap.clientHeight;
+      if (w < 20 || h < 20) return;
       // Only re-pin to the bottom if we were already there — don't yank a user
       // who has scrolled up to read history.
       const pinned = isAtBottom();
-      // Fit the ROWS to the visible height so every row (incl. the prompt) shows;
-      // width is allowed to overflow and pan horizontally, as before. 1.34 is a
-      // conservative cell-height-per-font-px so it fits with a small margin.
-      let fs = h / (lastEffRows * 1.34);
-      fs = Math.max(6, Math.min(fs, MOBILE_MAX_FONT));
+      // Derive the real per-font-pixel cell size from the current render so the
+      // fit is accurate for this font/renderer; fall back to conservative
+      // constants for Cascadia Mono if the internal dims aren't exposed.
+      const curFs = term.options.fontSize || 14;
+      let cwPerFs = 0.60, chPerFs = 1.34;
+      try {
+        const cell = term._core._renderService.dimensions.css.cell;
+        if (cell && cell.width && cell.height && curFs) {
+          cwPerFs = cell.width / curFs;
+          chPerFs = cell.height / curFs;
+        }
+      } catch (e) {}
+      // Font that exactly fills the width, and the one that exactly fills the
+      // height. The small margins keep us just inside the box so we never trip a
+      // scrollbar from sub-pixel rounding.
+      const fsWidth  = (w * 0.995) / (lastEffCols * cwPerFs);
+      const fsHeight = (h * 0.99)  / (lastEffRows * chPerFs);
+      // Fill the width, capped so we never exceed the height. If filling the width
+      // would make the font unreadably small (a wide grid on a narrow phone), fall
+      // back to fitting the rows to the height and letting the width pan.
+      let fs = fsWidth >= MIN_FILL_FONT ? Math.min(fsWidth, fsHeight) : fsHeight;
+      fs = Math.max(6, Math.min(fs, MAX_FONT));
       fs = Math.round(fs * 2) / 2;
       if (Math.abs((term.options.fontSize || 0) - fs) >= 0.5) {
         term.options.fontSize = fs;
@@ -449,13 +478,24 @@
       replaying = false;
       try { term.scrollToBottom(); } catch (e) {}
     }
+    // Tell the server whether the user is currently looking at this tab. A focused
+    // browser becomes the ConPTY size AUTHORITY (server side: setActive), so the
+    // shared terminal follows whichever screen you're actually on — the phone can
+    // shrink the grid to a readable width while you use it, and the moment you
+    // background it (switch app, lock, other tab) authority hands back to the
+    // native desktop terminal, which snaps clean again. One PTY has one size, so
+    // this "follow the focused screen" is the closest thing to per-device sizing.
+    function sendActive() {
+      send({ type: 'active', active: document.visibilityState === 'visible' });
+    }
+    document.addEventListener('visibilitychange', sendActive);
     function connect() {
       clearTimeout(reconnectTimer);
       if (!activeId) { setStatus('no sessions — run "moona claude"'); return; }
       if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
       setStatus('connecting...');
       ws = new WebSocket(wsURL());
-      ws.onopen = () => { setStatus('connected'); replaying = false; pendingOutput = []; lastReqCols = 0; lastReqRows = 0; lastEffCols = 0; lastEffRows = 0; fitAndResize(); term.focus(); };
+      ws.onopen = () => { setStatus('connected'); replaying = false; pendingOutput = []; lastReqCols = 0; lastReqRows = 0; lastEffCols = 0; lastEffRows = 0; fitAndResize(); sendActive(); term.focus(); };
       ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);

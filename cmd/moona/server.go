@@ -70,6 +70,13 @@ func readPump(s *session, c *client) {
 			if err := s.resize(c, msg.Cols, msg.Rows); err != nil {
 				c.queue(mustJSON(wsMessage{Type: "error", Message: err.Error()}))
 			}
+		case "active":
+			// The user focused/backgrounded this browser tab. A focused browser
+			// becomes the ConPTY size authority so the terminal follows the screen
+			// you're actually on (see setActive / minClientSizeLocked).
+			if err := s.setActive(c, msg.Active); err != nil {
+				c.queue(mustJSON(wsMessage{Type: "error", Message: err.Error()}))
+			}
 		case "ping":
 			c.queue(mustJSON(wsMessage{Type: "status", Message: "pong"}))
 		}
