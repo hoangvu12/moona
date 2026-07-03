@@ -18,7 +18,6 @@ type config struct {
 	rows        int
 	qr          bool
 	tunnel      bool
-	startPaused bool
 }
 
 func parseShareConfig(args []string) (config, error) {
@@ -87,7 +86,6 @@ func parseShortcutConfig(args []string) (config, error) {
 		cols:        *cols,
 		rows:        *rows,
 		qr:          *qr,
-		startPaused: true,
 		tunnel:      *tunnel,
 	}, nil
 }

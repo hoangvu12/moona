@@ -39,11 +39,18 @@ type client struct {
 type session struct {
 	cfg config
 
+	// id and command are set by the hub when the session is registered. command
+	// is the display string shown in `moona ls` and the browser tab bar.
+	id      string
+	command string
+	// onExit is invoked once when the underlying process ends, so the hub can
+	// drop the session from its registry. Set by the hub before the ConPTY starts.
+	onExit func()
+
 	mu           sync.Mutex
 	pty          *conpty.ConPty
 	running      bool
 	closed       bool
-	startAllowed bool
 	clients      map[*client]struct{}
 	buffer       *ringBuffer
 	// Effective (smallest-client) size last applied to the ConPTY. Broadcast to
@@ -55,10 +62,10 @@ type session struct {
 
 func newSession(cfg config) *session {
 	return &session{
-		cfg:          cfg,
-		startAllowed: !cfg.startPaused,
-		clients:      make(map[*client]struct{}),
-		buffer:       newRingBuffer(512 * 1024),
+		cfg:     cfg,
+		command: cfg.commandLine,
+		clients: make(map[*client]struct{}),
+		buffer:  newRingBuffer(512 * 1024),
 	}
 }
 
@@ -67,9 +74,6 @@ func (s *session) ensureStarted() error {
 	defer s.mu.Unlock()
 	if s.running && s.pty != nil {
 		return nil
-	}
-	if !s.startAllowed {
-		return errTerminalStartPending
 	}
 	if !conpty.IsAvailable() {
 		return conpty.ErrUnsupported
@@ -90,23 +94,6 @@ func (s *session) ensureStarted() error {
 	go s.readLoop(pty)
 	go s.waitLoop(pty)
 	return nil
-}
-
-var errTerminalStartPending = errors.New("terminal start is waiting for local confirmation")
-
-func (s *session) allowStart() {
-	s.mu.Lock()
-	s.startAllowed = true
-	clients := make([]*client, 0, len(s.clients))
-	for c := range s.clients {
-		clients = append(clients, c)
-	}
-	s.mu.Unlock()
-
-	msg := mustJSON(wsMessage{Type: "status", Message: "starting terminal"})
-	for _, c := range clients {
-		c.queue(msg)
-	}
 }
 
 func (s *session) attach(c *client) {
@@ -274,6 +261,28 @@ func (s *session) minSizeLocked(primaryOnly bool) (int, int) {
 	return cols, rows
 }
 
+// snapshot returns a point-in-time view of the session for the control API and
+// the browser tab bar.
+func (s *session) snapshot() sessionInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cols, rows := s.lastEffCols, s.lastEffRows
+	if cols <= 0 {
+		cols = s.cfg.cols
+	}
+	if rows <= 0 {
+		rows = s.cfg.rows
+	}
+	return sessionInfo{
+		ID:      s.id,
+		Command: s.command,
+		Cols:    cols,
+		Rows:    rows,
+		Clients: len(s.clients),
+		Running: s.running,
+	}
+}
+
 func (s *session) readLoop(pty *conpty.ConPty) {
 	buf := make([]byte, 32*1024)
 	for {
@@ -323,11 +332,17 @@ func (s *session) finishTerminal(pty *conpty.ConPty, message string) {
 	for c := range s.clients {
 		clients = append(clients, c)
 	}
+	onExit := s.onExit
 	s.mu.Unlock()
 
 	msg := mustJSON(wsMessage{Type: "status", Message: message})
 	for _, c := range clients {
 		c.queue(msg)
+	}
+	// Let the hub drop us from its registry so the session disappears from
+	// `moona ls` and the browser tab bar once the program has exited.
+	if onExit != nil {
+		onExit()
 	}
 }
 

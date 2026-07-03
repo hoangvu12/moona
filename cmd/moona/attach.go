@@ -15,21 +15,123 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// runAttach handles `moona attach [id] [flags]`. With no id it attaches to the
+// only running session (or lists them if there is more than one). It talks to
+// the local daemon by default, or a remote one via --url.
 func runAttach(args []string) error {
 	fs := flag.NewFlagSet("attach", flag.ContinueOnError)
 	fs.SetOutput(os.Stdout)
-	endpoint := fs.String("url", fmt.Sprintf("http://127.0.0.1:%d", defaultPort), "moona share URL to attach to")
+	endpoint := fs.String("url", "", "daemon URL to attach to (default: local daemon)")
 	token := fs.String("token", os.Getenv("MOONA_TOKEN"), "optional app token; can also use MOONA_TOKEN")
+	sessionID := fs.String("session", "", "session id to attach (see `moona ls`)")
 	quiet := fs.Bool("quiet", false, "suppress local attach status text")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// Allow `moona attach 2` as shorthand for `--session 2`.
+	if *sessionID == "" && fs.NArg() > 0 {
+		*sessionID = fs.Arg(0)
+	}
 
-	wsURL, err := attachWebSocketURL(*endpoint, *token)
+	base, tok := *endpoint, *token
+	if base == "" {
+		st, ok := daemonAlive()
+		if !ok {
+			return errors.New("moona daemon is not running; start a session with, e.g., `moona claude`")
+		}
+		base = st.LocalURL
+		if tok == "" {
+			tok = st.Token
+		}
+	}
+
+	id := *sessionID
+	if id == "" {
+		resolved, err := resolveSingleSession(base, tok)
+		if err != nil {
+			return err
+		}
+		id = resolved
+	}
+
+	wsURL, err := sessionWebSocketURL(base, tok, id, true)
 	if err != nil {
 		return err
 	}
+	return attachToWebSocketURL(wsURL, *quiet)
+}
 
+// attachSession attaches this terminal to a specific session on a known daemon.
+func attachSession(st daemonState, id string, quiet bool) error {
+	wsURL, err := sessionWebSocketURL(st.LocalURL, st.Token, id, true)
+	if err != nil {
+		return err
+	}
+	return attachToWebSocketURL(wsURL, quiet)
+}
+
+// resolveSingleSession picks the session to attach when none was named: the sole
+// session if there is exactly one, otherwise an error listing the choices.
+func resolveSingleSession(base, token string) (string, error) {
+	c := &apiClient{base: strings.TrimRight(base, "/"), token: token}
+	sessions, err := c.listSessions()
+	if err != nil {
+		return "", err
+	}
+	switch len(sessions) {
+	case 0:
+		return "", errors.New("no active sessions; start one with, e.g., `moona claude`")
+	case 1:
+		return sessions[0].ID, nil
+	default:
+		var b strings.Builder
+		b.WriteString("multiple sessions; pick one with `moona attach <id>`:\n")
+		for _, s := range sessions {
+			fmt.Fprintf(&b, "  %s  %s\n", s.ID, s.Command)
+		}
+		return "", errors.New(b.String())
+	}
+}
+
+func sessionWebSocketURL(base, token, sessionID string, primary bool) (string, error) {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		base = fmt.Sprintf("http://127.0.0.1:%d", defaultPort)
+	}
+	if !strings.Contains(base, "://") {
+		base = "http://" + base
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+	switch u.Scheme {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	case "ws", "wss":
+	default:
+		return "", fmt.Errorf("unsupported URL scheme %q", u.Scheme)
+	}
+	u.Path = "/ws"
+	q := u.Query()
+	if sessionID != "" {
+		q.Set("session", sessionID)
+	}
+	// A native terminal is the size authority — mark it so the daemon pins the
+	// ConPTY to it and lets browsers conform rather than shrink it.
+	if primary {
+		q.Set("primary", "1")
+	}
+	if token != "" {
+		q.Set("token", token)
+	}
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
+func attachToWebSocketURL(wsURL string, quiet bool) error {
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
 		return fmt.Errorf("connect to %s: %w", wsURL, err)
@@ -46,30 +148,30 @@ func runAttach(args []string) error {
 	// size poller, and the close handshake all write, so funnel them through one
 	// serialized helper.
 	var writeMu sync.Mutex
-	writeJSON := func(m wsMessage) error {
+	writeJSONMsg := func(m wsMessage) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
 		return conn.WriteJSON(m)
 	}
 
 	if cols > 0 && rows > 0 {
-		_ = writeJSON(wsMessage{Type: "resize", Cols: cols, Rows: rows})
+		_ = writeJSONMsg(wsMessage{Type: "resize", Cols: cols, Rows: rows})
 	}
-	if *quiet {
+	if quiet {
 		clearTerminalScreen(os.Stdout)
 	} else {
 		fmt.Fprintf(os.Stderr, "attached to %s\r\n", wsURL)
-		fmt.Fprintln(os.Stderr, "Ctrl-C is sent to the remote terminal. Close this window or stop moona share to detach.\r")
+		fmt.Fprintln(os.Stderr, "Ctrl-C is sent to the remote terminal. Close this window to detach; the session keeps running.\r")
 	}
 
 	done := make(chan error, 3)
 	stop := make(chan struct{})
 	defer close(stop)
 	go attachReceiveLoop(conn, done)
-	go attachInputLoop(writeJSON, done)
+	go attachInputLoop(writeJSONMsg, done)
 	// Track live console-window resizes (Windows has no SIGWINCH) so the native
 	// terminal stays the authoritative size and browsers follow it.
-	go attachResizeLoop(writeJSON, stop, done)
+	go attachResizeLoop(writeJSONMsg, stop, done)
 
 	err = <-done
 	writeMu.Lock()
@@ -79,41 +181,6 @@ func runAttach(args []string) error {
 		return err
 	}
 	return nil
-}
-
-func attachWebSocketURL(endpoint, token string) (string, error) {
-	endpoint = strings.TrimSpace(endpoint)
-	if endpoint == "" {
-		endpoint = fmt.Sprintf("http://127.0.0.1:%d", defaultPort)
-	}
-	if !strings.Contains(endpoint, "://") {
-		endpoint = "http://" + endpoint
-	}
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		return "", err
-	}
-	switch u.Scheme {
-	case "http":
-		u.Scheme = "ws"
-	case "https":
-		u.Scheme = "wss"
-	case "ws", "wss":
-	default:
-		return "", fmt.Errorf("unsupported URL scheme %q", u.Scheme)
-	}
-	if u.Path == "" || u.Path == "/" {
-		u.Path = "/ws"
-	}
-	// A native terminal is the size authority — mark it so the server pins the
-	// ConPTY to it and lets browsers conform rather than shrink it.
-	q := u.Query()
-	q.Set("primary", "1")
-	if token != "" && q.Get("token") == "" {
-		q.Set("token", token)
-	}
-	u.RawQuery = q.Encode()
-	return u.String(), nil
 }
 
 func attachReceiveLoop(conn *websocket.Conn, done chan<- error) {
@@ -146,12 +213,12 @@ func attachReceiveLoop(conn *websocket.Conn, done chan<- error) {
 	}
 }
 
-func attachInputLoop(writeJSON func(wsMessage) error, done chan<- error) {
+func attachInputLoop(writeJSONMsg func(wsMessage) error, done chan<- error) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := os.Stdin.Read(buf)
 		if n > 0 {
-			if writeErr := writeJSON(wsMessage{Type: "input", Data: string(buf[:n])}); writeErr != nil {
+			if writeErr := writeJSONMsg(wsMessage{Type: "input", Data: string(buf[:n])}); writeErr != nil {
 				done <- writeErr
 				return
 			}
@@ -166,7 +233,7 @@ func attachInputLoop(writeJSON func(wsMessage) error, done chan<- error) {
 // attachResizeLoop polls the local console size and forwards changes to the
 // session so resizing the native terminal window updates the ConPTY (and every
 // browser that conforms to it). Windows has no SIGWINCH, so we poll.
-func attachResizeLoop(writeJSON func(wsMessage) error, stop <-chan struct{}, done chan<- error) {
+func attachResizeLoop(writeJSONMsg func(wsMessage) error, stop <-chan struct{}, done chan<- error) {
 	lastCols, lastRows := 0, 0
 	ticker := time.NewTicker(350 * time.Millisecond)
 	defer ticker.Stop()
@@ -180,7 +247,7 @@ func attachResizeLoop(writeJSON func(wsMessage) error, stop <-chan struct{}, don
 				continue
 			}
 			lastCols, lastRows = cols, rows
-			if err := writeJSON(wsMessage{Type: "resize", Cols: cols, Rows: rows}); err != nil {
+			if err := writeJSONMsg(wsMessage{Type: "resize", Cols: cols, Rows: rows}); err != nil {
 				select {
 				case done <- err:
 				default:

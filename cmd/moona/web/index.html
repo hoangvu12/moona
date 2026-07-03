@@ -11,8 +11,15 @@
     html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #05070a; color: var(--text); font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { display: flex; flex-direction: column; }
     #topbar { min-height: 42px; display: flex; align-items: center; gap: 8px; padding: 6px 8px calc(6px + env(safe-area-inset-top)); background: var(--bar); border-bottom: 1px solid var(--line); }
-    #brand { font-weight: 700; letter-spacing: .02em; }
-    #status { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #brand { font-weight: 700; letter-spacing: .02em; flex: 0 0 auto; }
+    #status { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 0 auto; margin-left: auto; }
+    /* Session tabs: one per live daemon session; tap to switch which terminal
+       this page is mirroring. Scrolls horizontally when there are many. */
+    #tabs { display: flex; gap: 4px; overflow-x: auto; flex: 1 1 auto; min-width: 0; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+    #tabs::-webkit-scrollbar { display: none; }
+    .tab { flex: 0 0 auto; max-width: 44vw; border: 1px solid var(--line); background: #0d1420; color: var(--muted); padding: 5px 10px; border-radius: 8px; font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .tab.active { background: #1b2740; color: var(--text); border-color: #38bdf8; }
+    .tab .tid { color: #38bdf8; font-weight: 700; margin-right: 5px; }
     /* The grid is pinned to the native terminal's size (not the device's), so on
        a narrow phone it can be wider than the screen. Allow horizontal panning;
        xterm keeps vertical scroll via its own .xterm-viewport. Pinch-zoom also
@@ -51,6 +58,11 @@
   </style>
 </head>
 <body>
+  <div id="topbar">
+    <span id="brand">moona</span>
+    <div id="tabs"></div>
+    <span id="status"></span>
+  </div>
   <div id="terminal-wrap"><div id="terminal"></div></div>
   <div id="kb"><div id="kb-grid"></div></div>
 
@@ -79,12 +91,65 @@
     let ws = null;
     let reconnectTimer = null;
     let resizeTimer = null;
+    // Session tab state. The daemon can hold many sessions; this page mirrors one
+    // at a time and lets you switch between them like tabs.
+    let sessions = [];
+    let activeId = params.get('session') || (location.hash ? location.hash.slice(1) : '') || null;
+    const tabsEl = document.getElementById('tabs');
 
     function setStatus(text) { if (statusEl) statusEl.textContent = text; }
+    function apiQuery() { return token ? ('?token=' + encodeURIComponent(token)) : ''; }
     function wsURL() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const suffix = token ? ('?token=' + encodeURIComponent(token)) : '';
-      return proto + '//' + location.host + '/ws' + suffix;
+      const p = new URLSearchParams();
+      if (activeId) p.set('session', activeId);
+      if (token) p.set('token', token);
+      const q = p.toString();
+      return proto + '//' + location.host + '/ws' + (q ? '?' + q : '');
+    }
+
+    function renderTabs() {
+      if (!tabsEl) return;
+      tabsEl.innerHTML = '';
+      for (const s of sessions) {
+        const b = document.createElement('button');
+        b.className = 'tab' + (s.id === activeId ? ' active' : '');
+        const label = (s.command || '').split(/[\\/]/).pop() || s.command || 'session';
+        b.innerHTML = '<span class="tid">' + s.id + '</span>' + label.replace(/[<>&]/g, '');
+        b.title = s.command || '';
+        b.addEventListener('click', () => selectSession(s.id));
+        tabsEl.appendChild(b);
+      }
+    }
+
+    function selectSession(id) {
+      if (!id || id === activeId) return;
+      activeId = id;
+      try { history.replaceState(null, '', '#' + id); } catch (e) {}
+      renderTabs();
+      if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+      clearTimeout(reconnectTimer);
+      term.reset();
+      lastReqCols = 0; lastReqRows = 0; lastEffCols = 0; lastEffRows = 0;
+      connect();
+    }
+
+    async function refreshSessions() {
+      let list;
+      try {
+        const r = await fetch('/api/sessions' + apiQuery());
+        if (!r.ok) throw new Error('http ' + r.status);
+        list = await r.json();
+      } catch (e) { return; }
+      sessions = Array.isArray(list) ? list : [];
+      // Keep the current selection if it still exists; otherwise fall back to the
+      // first session (or nothing).
+      if (!activeId || !sessions.find(s => s.id === activeId)) {
+        const first = sessions[0];
+        if (first) { selectSession(first.id); }
+        else { activeId = null; if (ws) { try { ws.close(); } catch (e) {} ws = null; } setStatus('no sessions — run "moona claude"'); }
+      }
+      renderTabs();
     }
     function send(msg) {
       if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
@@ -143,6 +208,8 @@
     }
     function connect() {
       clearTimeout(reconnectTimer);
+      if (!activeId) { setStatus('no sessions — run "moona claude"'); return; }
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
       setStatus('connecting...');
       ws = new WebSocket(wsURL());
       ws.onopen = () => { setStatus('connected'); lastReqCols = 0; lastReqRows = 0; lastEffCols = 0; lastEffRows = 0; fitAndResize(); term.focus(); };
@@ -178,7 +245,7 @@
               try { term.scrollToBottom(); } catch (e) {}
             }
           }
-          else if (msg.type === 'status') setStatus(msg.message || 'connected');
+          else if (msg.type === 'status') { setStatus(msg.message || 'connected'); if ((msg.message || '').indexOf('exited') >= 0) refreshSessions(); }
           else if (msg.type === 'error') { setStatus(msg.message || 'error'); term.writeln('\r\n[moona] ' + (msg.message || 'error')); }
         } catch (e) {}
       };
@@ -351,7 +418,10 @@
     })();
 
     fitAndResize();
-    connect();
+    // Discover sessions, connect to one, and keep the tab bar fresh so sessions
+    // started/stopped from any terminal show up here within a few seconds.
+    refreshSessions().then(() => { if (activeId) connect(); });
+    setInterval(refreshSessions, 3000);
   </script>
 </body>
 </html>

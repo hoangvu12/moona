@@ -8,26 +8,46 @@ import (
 	qrcode "github.com/skip2/go-qrcode"
 )
 
-func printPhoneQR(running *runningShare) {
-	if !running.cfg.qr {
-		return
+// printDashboard prints the link(s), an optional QR code, and usage hints. It is
+// the single "control panel" view shown when you start `moona daemon`, re-run it
+// while one is already up, or call `moona qr`.
+func printDashboard(localURL, publicURL, host, token string, qr bool) {
+	terminalPrintln(os.Stdout, "Moona daemon is running")
+	terminalPrintln(os.Stdout, "Local:  ", browserURL(localURL, token))
+	if publicURL != "" {
+		terminalPrintln(os.Stdout, "Public: ", browserURL(publicURL, token))
+	} else {
+		terminalPrintln(os.Stdout, "Public:  (no tunnel; local network / --tunnel to enable)")
 	}
-	target := running.publicURL
-	label := "Scan on phone"
-	if target == "" {
-		if isLoopbackHost(running.cfg.host) {
-			return
+	if token != "" {
+		terminalPrintln(os.Stdout, "Token:   enabled; links above include it")
+	}
+	terminalPrintln(os.Stdout)
+
+	if qr {
+		target := publicURL
+		label := "Scan on phone"
+		if target == "" {
+			if !isLoopbackHost(host) {
+				target = localURL
+				label = "Scan on phone (same network only)"
+			}
 		}
-		target = running.localURL
-		label = "Scan on phone (same network only)"
+		if target != "" {
+			openURL := browserURL(target, token)
+			terminalPrintln(os.Stdout, label+":")
+			terminalPrintf(os.Stdout, "%s", renderTerminalQR(openURL))
+			terminalPrintln(os.Stdout)
+		}
 	}
-	openURL := browserURL(target, running.cfg.token)
-	terminalPrintln(os.Stdout, label+":")
-	terminalPrintln(os.Stdout, openURL)
-	if running.cfg.token != "" {
-		terminalPrintln(os.Stdout, "(QR includes the app token.)")
-	}
-	terminalPrintf(os.Stdout, "%s", renderTerminalQR(openURL))
+
+	terminalPrintln(os.Stdout, "Start a session in another tab (opens instantly, no prompt):")
+	terminalPrintln(os.Stdout, "  moona claude          moona codex          moona pwsh.exe")
+	terminalPrintln(os.Stdout, "List / manage sessions:")
+	terminalPrintln(os.Stdout, "  moona ls              moona attach <id>    moona kill <id>")
+	terminalPrintln(os.Stdout)
+	terminalPrintln(os.Stdout, "The phone web page shows every session as a switchable tab.")
+	terminalPrintln(os.Stdout, "Stop the daemon with `moona daemon stop` (or Ctrl+C here).")
 }
 
 func browserURL(base, token string) string {

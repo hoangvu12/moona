@@ -20,26 +20,21 @@ type tempTunnel struct {
 	cmd *exec.Cmd
 }
 
-func maybeStartTunnel(running *runningShare) error {
-	if !running.cfg.tunnel {
-		return nil
-	}
-
+// startBestTunnel tries each tunnel provider in order and returns the first one
+// that yields a public URL. The caller decides whether tunnelling is enabled.
+func startBestTunnel(port int) (*tempTunnel, string, error) {
 	var failures []string
-	for _, provider := range tunnelProviders(running.cfg.port) {
+	for _, provider := range tunnelProviders(port) {
 		terminalPrintln(os.Stderr, "starting temporary tunnel via ", provider.name, "...")
 		tunnel, publicURL, err := startTunnelProvider(provider, 45*time.Second)
 		if err != nil {
 			failures = append(failures, provider.name+": "+err.Error())
 			continue
 		}
-		running.tunnel = tunnel
-		running.publicURL = publicURL
 		terminalPrintln(os.Stderr, "tunnel ready via ", provider.name)
-		return nil
+		return tunnel, publicURL, nil
 	}
-
-	return fmt.Errorf("all tunnel providers failed: %s", strings.Join(failures, " | "))
+	return nil, "", fmt.Errorf("all tunnel providers failed: %s", strings.Join(failures, " | "))
 }
 
 type tunnelProvider struct {
