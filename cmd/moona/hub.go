@@ -12,6 +12,9 @@ import (
 type sessionInfo struct {
 	ID      string `json:"id"`
 	Command string `json:"command"`
+	// Title is the live terminal window title (OSC 0/2), shown as the browser tab
+	// label. Empty until the program sets one; the browser then falls back to Command.
+	Title   string `json:"title,omitempty"`
 	Cols    int    `json:"cols"`
 	Rows    int    `json:"rows"`
 	Clients int    `json:"clients"`
@@ -30,6 +33,13 @@ type hub struct {
 	// the daemon can push the fresh list to every connected browser instead of
 	// making them poll. Must not be called while holding h.mu.
 	onChange func()
+	// Title-change throttle. Window titles can update rapidly (a program showing
+	// progress in its title), and each push traverses the tunnel — which we keep
+	// deliberately quiet to stay under metered-tunnel request caps. Coalesce title
+	// pushes to at most one per second, with a trailing push for the last change.
+	titleMu      sync.Mutex
+	titleTimer   *time.Timer
+	titlePending bool
 }
 
 func newHub() *hub {
@@ -49,6 +59,7 @@ func (h *hub) createSession(cfg config) (*session, error) {
 	id := fmt.Sprintf("%d", h.seq)
 	sess.id = id
 	sess.onExit = func() { h.remove(id) }
+	sess.onTitleChange = h.notifyTitleChange
 	h.sessions[id] = sess
 	h.mu.Unlock()
 
@@ -69,6 +80,32 @@ func (h *hub) notifyChange() {
 	if cb != nil {
 		cb()
 	}
+}
+
+// notifyTitleChange pushes an updated session list on a title change, throttled
+// to at most once per second (leading edge fires immediately; a trailing edge
+// fires once more if further changes arrived during the window). This keeps a
+// chatty title from flooding the tunnel while still reflecting the latest label.
+func (h *hub) notifyTitleChange() {
+	h.titleMu.Lock()
+	if h.titleTimer != nil {
+		// A push went out within the last second; remember to send one more.
+		h.titlePending = true
+		h.titleMu.Unlock()
+		return
+	}
+	h.titleTimer = time.AfterFunc(time.Second, func() {
+		h.titleMu.Lock()
+		pending := h.titlePending
+		h.titlePending = false
+		h.titleTimer = nil
+		h.titleMu.Unlock()
+		if pending {
+			h.notifyTitleChange()
+		}
+	})
+	h.titleMu.Unlock()
+	h.notifyChange()
 }
 
 func (h *hub) get(id string) *session {

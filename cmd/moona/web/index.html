@@ -11,15 +11,15 @@
     html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #05070a; color: var(--text); font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { display: flex; flex-direction: column; }
     #topbar { min-height: 42px; display: flex; align-items: center; gap: 8px; padding: 6px 8px calc(6px + env(safe-area-inset-top)); background: var(--bar); border-bottom: 1px solid var(--line); }
-    #brand { font-weight: 700; letter-spacing: .02em; flex: 0 0 auto; }
-    #status { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 0 auto; margin-left: auto; }
     /* Session tabs: one per live daemon session; tap to switch which terminal
-       this page is mirroring. Scrolls horizontally when there are many. */
+       this page is mirroring. Each tab is labelled with the session's live
+       terminal title (falling back to the command). Scrolls horizontally when
+       there are more tabs than fit — the bar owns the row's flexible width and
+       pans on touch, with the scrollbar hidden for a clean look. */
     #tabs { display: flex; gap: 4px; overflow-x: auto; flex: 1 1 auto; min-width: 0; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
     #tabs::-webkit-scrollbar { display: none; }
     .tab { flex: 0 0 auto; max-width: 44vw; border: 1px solid var(--line); background: #0d1420; color: var(--muted); padding: 5px 10px; border-radius: 8px; font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .tab.active { background: #1b2740; color: var(--text); border-color: #38bdf8; }
-    .tab .tid { color: #38bdf8; font-weight: 700; margin-right: 5px; }
     /* New-session button: always visible so an all-exited phone is never a dead
        end and you can start work (e.g. claude) without going back to the PC. */
     #addtab { flex: 0 0 auto; width: 32px; padding: 5px 0; border: 1px solid var(--line); background: #0d1420; color: var(--text); border-radius: 8px; font-size: 16px; font-weight: 700; line-height: 1; }
@@ -50,7 +50,6 @@
     .xterm .xterm-viewport { overflow-y: auto; touch-action: pan-x pinch-zoom; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
     @media (max-width: 640px) {
       #topbar { min-height: 38px; }
-      #brand { font-size: 13px; }
       button { padding: 9px 11px; }
       #terminal-wrap { padding: 6px 6px 2px; }
     }
@@ -97,10 +96,8 @@
 </head>
 <body>
   <div id="topbar">
-    <span id="brand">moona</span>
     <div id="tabs"></div>
     <button id="addtab" title="Start a new session">＋</button>
-    <span id="status"></span>
   </div>
   <div id="terminal-wrap"><div id="terminal"></div></div>
   <div id="kb"><div id="kb-grid"></div></div>
@@ -276,9 +273,12 @@
       for (const s of sessions) {
         const b = document.createElement('button');
         b.className = 'tab' + (s.id === activeId ? ' active' : '');
-        const label = (s.command || '').split(/[\\/]/).pop() || s.command || 'session';
-        b.innerHTML = '<span class="tid">' + s.id + '</span>' + label.replace(/[<>&]/g, '');
-        b.title = s.command || '';
+        // Prefer the live terminal title (set via OSC 0/2 by the running program
+        // and refreshed by the server as it changes). Fall back to the command's
+        // basename until a title arrives. textContent avoids any HTML-escaping.
+        const cmdName = (s.command || '').split(/[\\/]/).pop() || s.command || '';
+        b.textContent = (s.title && s.title.trim()) || cmdName || 'session';
+        b.title = s.title || s.command || '';
         b.addEventListener('click', () => selectSession(s.id));
         tabsEl.appendChild(b);
       }
@@ -503,10 +503,25 @@
 
     // ---- Mobile keyboard: sticky modifiers + special keys (Termius-style) ----
     const ESC = String.fromCharCode(27);
-    const mod = { ctrl: { on: false, lock: false }, alt: { on: false, lock: false } };
+    const TAB = String.fromCharCode(9);
+    const mod = { ctrl: { on: false, lock: false }, alt: { on: false, lock: false }, shift: { on: false, lock: false } };
+    // Shift is a sticky modifier like Ctrl/Alt. This bar has no letter keys
+    // (letters come from the phone's native keyboard), so Shift's real job here is
+    // the shifted CONTROL keys TUIs rely on — above all Shift+Tab (backtab), which
+    // Claude Code uses to cycle permission modes. Map each base sequence to its
+    // shifted CSI form; sendSeq swaps it in when Shift is armed.
+    const SHIFT_SEQ = {
+      [TAB]: ESC + '[Z',            // Shift+Tab -> BackTab
+      [ESC + '[A']: ESC + '[1;2A',  // Shift+Up
+      [ESC + '[B']: ESC + '[1;2B',  // Shift+Down
+      [ESC + '[C']: ESC + '[1;2C',  // Shift+Right
+      [ESC + '[D']: ESC + '[1;2D',  // Shift+Left
+      [ESC + '[H']: ESC + '[1;2H',  // Shift+Home
+      [ESC + '[F']: ESC + '[1;2F',  // Shift+End
+    };
 
     function renderMods() {
-      for (const name of ['ctrl', 'alt']) {
+      for (const name of ['ctrl', 'alt', 'shift']) {
         const el = document.getElementById('mod-' + name);
         if (!el) continue;
         el.classList.toggle('armed', mod[name].on && !mod[name].lock);
@@ -523,7 +538,7 @@
     }
     function clearOneShot() {
       let changed = false;
-      for (const name of ['ctrl', 'alt']) {
+      for (const name of ['ctrl', 'alt', 'shift']) {
         if (mod[name].on && !mod[name].lock) { mod[name].on = false; changed = true; }
       }
       if (changed) renderMods();
@@ -537,21 +552,27 @@
       return ch;
     }
     function applyMods(ch) {
-      let out = ch;
-      if (mod.ctrl.on) out = ctrlByte(ch);
+      let base = (mod.shift.on && ch.length === 1) ? ch.toUpperCase() : ch;
+      let out = mod.ctrl.on ? ctrlByte(base) : base;
       if (mod.alt.on) out = ESC + out; // Alt = ESC prefix (xterm meta convention)
       return out;
     }
     // A single printable char from the OS keyboard or a tapped symbol key.
     function typeChar(ch) { sendInput(applyMods(ch)); clearOneShot(); }
-    // A fixed control sequence (Esc, Tab, arrows, Fn...). Alt still prepends ESC.
-    function sendSeq(seq) { sendInput(mod.alt.on ? ESC + seq : seq); clearOneShot(); }
+    // A fixed control sequence (Esc, Tab, arrows, Fn...). Shift swaps in the
+    // shifted variant (e.g. Tab -> BackTab); Alt still prepends ESC.
+    function sendSeq(seq) {
+      let out = (mod.shift.on && SHIFT_SEQ[seq]) ? SHIFT_SEQ[seq] : seq;
+      if (mod.alt.on) out = ESC + out;
+      sendInput(out);
+      clearOneShot();
+    }
 
     // Route OS soft-keyboard input through the modifier logic. Single chars get
     // Ctrl/Alt applied; multi-char input (paste, IME, or an ANSI sequence xterm
     // produced for a hardware key) passes through untouched.
     term.onData((data) => {
-      if (data.length === 1 && (mod.ctrl.on || mod.alt.on)) { typeChar(data); return; }
+      if (data.length === 1 && (mod.ctrl.on || mod.alt.on || mod.shift.on)) { typeChar(data); return; }
       clearOneShot();
       sendInput(data);
     });
@@ -571,37 +592,62 @@
     ];
     const ARROWS = { up: ESC + '[A', down: ESC + '[B', left: ESC + '[D', right: ESC + '[C' };
 
-    // Fire on pointerdown + preventDefault so a tap never steals focus from
-    // xterm's hidden textarea (which would dismiss the phone keyboard).
+    // How far (px) a finger may travel between press and release and still count
+    // as a tap. Beyond this it's a scroll of the key grid, so the key must NOT fire.
+    const TAP_SLOP = 10;
+    // preventDefault on pointerdown keeps focus on xterm's hidden textarea (so the
+    // native keyboard doesn't dismiss), but we DEFER the actual keypress to
+    // pointerup and only fire it if the finger didn't travel. Firing on pointerdown
+    // (the old behaviour) meant a swipe to scroll the grid "pressed" whatever key it
+    // began on. The grid scroll cancels our pointer (pointercancel) or moves it past
+    // TAP_SLOP (pointermove) — either way the key is disarmed and stays silent.
     function makeKey(label, opts) {
       opts = opts || {};
       const b = document.createElement('button');
       b.className = 'kb-key' + (opts.cls ? ' ' + opts.cls : '');
       b.textContent = label;
       if (opts.id) b.id = opts.id;
+      const fire = () => { if (opts.onTap) opts.onTap(); term.focus(); };
       if (opts.useClick) {
-        b.addEventListener('click', () => { if (opts.onTap) opts.onTap(); term.focus(); });
-      } else {
-        b.addEventListener('pointerdown', (e) => { e.preventDefault(); if (opts.onTap) opts.onTap(); term.focus(); });
+        // click already fires only on a genuine tap (never mid-scroll).
+        b.addEventListener('click', fire);
+        return b;
       }
+      let sx = 0, sy = 0, tapping = false;
+      b.addEventListener('pointerdown', (e) => { e.preventDefault(); sx = e.clientX; sy = e.clientY; tapping = true; });
+      b.addEventListener('pointermove', (e) => {
+        if (tapping && (Math.abs(e.clientX - sx) > TAP_SLOP || Math.abs(e.clientY - sy) > TAP_SLOP)) tapping = false;
+      });
+      b.addEventListener('pointerup', () => { if (tapping) { tapping = false; fire(); } });
+      b.addEventListener('pointercancel', () => { tapping = false; });
       return b;
     }
-    // Press-and-hold auto-repeat, used for arrows.
+    // Press-and-hold auto-repeat, used for arrows. Same tap/scroll discipline as
+    // makeKey: a quick tap fires one key on release; a hold repeats after 350ms; a
+    // swipe that scrolls the grid disarms it and sends nothing.
     function makeRepeatKey(label, seq) {
       const b = document.createElement('button');
       b.className = 'kb-key';
       b.textContent = label;
-      let delayT = null, repT = null;
+      let delayT = null, repT = null, sx = 0, sy = 0, tapping = false, repeated = false;
       const stop = () => { clearTimeout(delayT); clearInterval(repT); delayT = repT = null; };
+      const disarm = () => { tapping = false; stop(); };
       b.addEventListener('pointerdown', (e) => {
         e.preventDefault();
-        sendSeq(seq);
-        delayT = setTimeout(() => { repT = setInterval(() => sendInput(seq), 90); }, 350);
+        sx = e.clientX; sy = e.clientY; tapping = true; repeated = false;
+        delayT = setTimeout(() => {
+          if (!tapping) return;
+          repeated = true; sendSeq(seq);
+          repT = setInterval(() => sendInput(seq), 90);
+        }, 350);
         term.focus();
       });
-      b.addEventListener('pointerup', stop);
-      b.addEventListener('pointerleave', stop);
-      b.addEventListener('pointercancel', stop);
+      b.addEventListener('pointermove', (e) => {
+        if (tapping && (Math.abs(e.clientX - sx) > TAP_SLOP || Math.abs(e.clientY - sy) > TAP_SLOP)) disarm();
+      });
+      b.addEventListener('pointerup', () => { if (tapping && !repeated) sendSeq(seq); disarm(); });
+      b.addEventListener('pointerleave', disarm);
+      b.addEventListener('pointercancel', disarm);
       return b;
     }
 
@@ -609,12 +655,18 @@
     const addKey = (node) => kbGrid.appendChild(node);
     const addDivider = () => { const d = document.createElement('div'); d.className = 'kb-divider'; kbGrid.appendChild(d); };
 
-    // Row 1: modifiers, Esc, Tab.
+    // Row 1: modifiers + Esc.
     addKey(makeKey('Ctrl', { id: 'mod-ctrl', cls: 'mod', onTap: () => cycleMod('ctrl') }));
     addKey(makeKey('Alt', { id: 'mod-alt', cls: 'mod', onTap: () => cycleMod('alt') }));
+    addKey(makeKey('Shift', { id: 'mod-shift', cls: 'mod', onTap: () => cycleMod('shift') }));
     addKey(makeKey('Esc', { onTap: () => sendSeq(ESC) }));
-    addKey(makeKey('Tab', { onTap: () => sendSeq(String.fromCharCode(9)) }));
-    // Row 2: arrows (press-and-hold to auto-repeat).
+    // Row 2: the everyday editing keys. Enter/Backspace/Tab go through sendSeq so
+    // Alt and Shift compose (Shift+Tab is BackTab; Alt+Backspace deletes a word).
+    addKey(makeKey('Tab', { onTap: () => sendSeq(TAB) }));
+    addKey(makeKey('⌫', { onTap: () => sendSeq(String.fromCharCode(127)) }));   // Backspace (DEL)
+    addKey(makeKey('Space', { onTap: () => typeChar(' ') }));
+    addKey(makeKey('Enter', { onTap: () => sendSeq(String.fromCharCode(13)) })); // CR
+    // Row 3: arrows (press-and-hold to auto-repeat).
     addKey(makeRepeatKey('←', ARROWS.left));
     addKey(makeRepeatKey('↑', ARROWS.up));
     addKey(makeRepeatKey('↓', ARROWS.down));

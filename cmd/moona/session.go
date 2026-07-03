@@ -60,9 +60,23 @@ type session struct {
 	// is the display string shown in `moona ls` and the browser tab bar.
 	id      string
 	command string
+	// title is the live terminal window title, parsed out of the ConPTY output
+	// stream (OSC 0/2 sequences). Programs like Claude Code and the shell update
+	// it over time to reflect what they are doing, so the browser tab bar mirrors
+	// it (falling back to command until a title arrives). Guarded by mu.
+	title string
 	// onExit is invoked once when the underlying process ends, so the hub can
 	// drop the session from its registry. Set by the hub before the ConPTY starts.
 	onExit func()
+	// onTitleChange is invoked (off-lock) when title changes value, so the hub can
+	// push a fresh session list to browsers. Set by the hub; throttled there.
+	onTitleChange func()
+	// Incremental OSC-title parser state, carried across read chunks (a title
+	// sequence can straddle a Read boundary). See scanTitleLocked.
+	tScan    int
+	tPs      []byte
+	tIsTitle bool
+	tBuf     []byte
 
 	mu      sync.Mutex
 	pty     *conpty.ConPty
@@ -327,11 +341,89 @@ func (s *session) snapshot() sessionInfo {
 	return sessionInfo{
 		ID:      s.id,
 		Command: s.command,
+		Title:   s.title,
 		Cols:    cols,
 		Rows:    rows,
 		Clients: len(s.clients),
 		Running: s.running,
 	}
+}
+
+// scanTitleLocked feeds a chunk of raw ConPTY output through an incremental
+// parser that watches for terminal window-title sequences — OSC 0 (icon+title)
+// and OSC 2 (title) — of the form ESC ] 0 ; <text> BEL (or ...ST). The parser
+// state lives on the session so a sequence split across two Reads still resolves.
+// It returns true when a NEW title (different from the current one) was fully
+// received, so the caller can trigger a tab-bar refresh. Caller holds s.mu.
+//
+// titleMax caps an accumulated title so a program that never terminates its OSC
+// (or a hostile stream) can't grow the buffer without bound.
+const titleMax = 512
+
+func (s *session) scanTitleLocked(chunk []byte) bool {
+	changed := false
+	commit := func() {
+		if s.tIsTitle && len(s.tBuf) > 0 {
+			t := string(s.tBuf)
+			if t != s.title {
+				s.title = t
+				changed = true
+			}
+		}
+		s.tIsTitle = false
+		s.tBuf = s.tBuf[:0]
+	}
+	for _, b := range chunk {
+		switch s.tScan {
+		case 0: // ground: hunt for ESC
+			if b == 0x1b {
+				s.tScan = 1
+			}
+		case 1: // after ESC: an OSC opens with ']'
+			if b == ']' {
+				s.tScan = 2
+				s.tPs = s.tPs[:0]
+			} else if b != 0x1b {
+				s.tScan = 0
+			}
+		case 2: // reading the OSC command number (Ps) up to ';'
+			if b >= '0' && b <= '9' {
+				if len(s.tPs) < 4 {
+					s.tPs = append(s.tPs, b)
+				}
+			} else if b == ';' {
+				ps := string(s.tPs)
+				s.tIsTitle = ps == "0" || ps == "2"
+				s.tBuf = s.tBuf[:0]
+				s.tScan = 3
+			} else {
+				s.tScan = 0 // not an OSC we track
+			}
+		case 3: // OSC payload: accumulate until BEL or ST (ESC \)
+			if b == 0x07 { // BEL terminator
+				commit()
+				s.tScan = 0
+			} else if b == 0x1b { // maybe the ESC of an ST terminator
+				s.tScan = 4
+			} else if s.tIsTitle && len(s.tBuf) < titleMax {
+				s.tBuf = append(s.tBuf, b)
+			}
+		case 4: // saw ESC inside OSC payload: ST is ESC '\'
+			if b == '\\' { // string terminator
+				commit()
+				s.tScan = 0
+			} else {
+				// Not a valid ST: the OSC ended abnormally. Commit what we have and
+				// reprocess this byte from ground so a new ESC isn't lost.
+				commit()
+				s.tScan = 0
+				if b == 0x1b {
+					s.tScan = 1
+				}
+			}
+		}
+	}
+	return changed
 }
 
 func (s *session) readLoop(pty *conpty.ConPty) {
@@ -342,6 +434,8 @@ func (s *session) readLoop(pty *conpty.ConPty) {
 			chunk := append([]byte(nil), buf[:n]...)
 			s.mu.Lock()
 			s.buffer.Write(chunk)
+			titleChanged := s.scanTitleLocked(chunk)
+			onTitle := s.onTitleChange
 			clients := make([]*client, 0, len(s.clients))
 			for c := range s.clients {
 				clients = append(clients, c)
@@ -350,6 +444,11 @@ func (s *session) readLoop(pty *conpty.ConPty) {
 			msg := mustJSON(wsMessage{Type: "output", Data: string(chunk)})
 			for _, c := range clients {
 				c.queue(msg)
+			}
+			// A new window title just means the tab bar's label changed; push the
+			// refreshed session list so every browser relabels its tab live.
+			if titleChanged && onTitle != nil {
+				onTitle()
 			}
 		}
 		if err != nil {
