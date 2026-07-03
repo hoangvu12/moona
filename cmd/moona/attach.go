@@ -161,7 +161,7 @@ func attachToWebSocketURL(wsURL string, quiet bool) error {
 		clearTerminalScreen(os.Stdout)
 	} else {
 		fmt.Fprintf(os.Stderr, "attached to %s\r\n", wsURL)
-		fmt.Fprintln(os.Stderr, "Ctrl-C is sent to the remote terminal. Close this window to detach; the session keeps running.\r")
+		fmt.Fprintln(os.Stderr, "Ctrl-C is sent to the remote terminal. Press Ctrl-] to detach; the session keeps running.\r")
 	}
 
 	done := make(chan error, 3)
@@ -177,11 +177,28 @@ func attachToWebSocketURL(wsURL string, quiet bool) error {
 	writeMu.Lock()
 	_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 	writeMu.Unlock()
+	if errors.Is(err, errDetached) {
+		if !quiet {
+			fmt.Fprintln(os.Stderr, "\r\n[moona] detached; the session keeps running.\r")
+		}
+		return nil
+	}
 	if err != nil && !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) && !errors.Is(err, io.EOF) {
 		return err
 	}
 	return nil
 }
+
+// errDetached signals that the user pressed the detach key (Ctrl-]) rather than
+// the remote program exiting. attachToWebSocketURL treats it as a clean return so
+// the caller (e.g. the dashboard TUI, or a plain `moona attach`) resumes without
+// killing the session.
+var errDetached = errors.New("detached")
+
+// detachByte is Ctrl-] (0x1d) -- the classic telnet escape, chosen because it is
+// almost never used by shells or full-screen TUIs, so forwarding everything else
+// raw stays safe.
+const detachByte = 0x1d
 
 func attachReceiveLoop(conn *websocket.Conn, done chan<- error) {
 	for {
@@ -218,6 +235,15 @@ func attachInputLoop(writeJSONMsg func(wsMessage) error, done chan<- error) {
 	for {
 		n, err := os.Stdin.Read(buf)
 		if n > 0 {
+			// Detach on Ctrl-]: forward any input that preceded it, then stop the
+			// passthrough cleanly (the session stays alive in the daemon).
+			if i := indexByte(buf[:n], detachByte); i >= 0 {
+				if i > 0 {
+					_ = writeJSONMsg(wsMessage{Type: "input", Data: string(buf[:i])})
+				}
+				done <- errDetached
+				return
+			}
 			if writeErr := writeJSONMsg(wsMessage{Type: "input", Data: string(buf[:n])}); writeErr != nil {
 				done <- writeErr
 				return
@@ -228,6 +254,15 @@ func attachInputLoop(writeJSONMsg func(wsMessage) error, done chan<- error) {
 			return
 		}
 	}
+}
+
+func indexByte(b []byte, c byte) int {
+	for i, x := range b {
+		if x == c {
+			return i
+		}
+	}
+	return -1
 }
 
 // attachResizeLoop polls the local console size and forwards changes to the

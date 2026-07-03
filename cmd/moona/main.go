@@ -21,11 +21,14 @@ func main() {
 func run(args []string) error {
 	if len(args) == 0 {
 		maybeAutoUpdate(args)
-		return runShare(args)
+		return runUI(args)
 	}
 	switch args[0] {
 	case "daemon", "hub":
 		return runDaemon(args[1:])
+	case "ui", "dash", "tui", "manage":
+		maybeAutoUpdate(args)
+		return runUI(args[1:])
 	case "share", "serve":
 		maybeAutoUpdate(args)
 		return runShare(args[1:])
@@ -61,12 +64,14 @@ func printHelp() {
 	fmt.Println(`Moona - Windows-native web terminal for phone access
 
 Usage:
+  moona                          open the session-manager dashboard (TUI)
   moona <command> [args...]      start <command> in a new session and attach (instant)
   moona claude                   e.g. start Claude Code, attached to this terminal
   moona share [flags]            start the default shell in a session and attach
   moona share -- codex           start codex in a session
   moona share --cmd "pwsh.exe"   start a raw command line in a session
 
+  moona ui                       open the dashboard (same as bare moona)
   moona daemon [flags]           run the background switchboard (link + QR live here)
   moona daemon stop              stop the switchboard and all sessions
   moona ls                       list active sessions
