@@ -20,6 +20,9 @@ type wsMessage struct {
 	Cols    int    `json:"cols,omitempty"`
 	Rows    int    `json:"rows,omitempty"`
 	Message string `json:"message,omitempty"`
+	// Sessions carries the daemon's current session list on a {type:"sessions"}
+	// frame, so browsers refresh their tab bar from a push instead of polling.
+	Sessions []sessionInfo `json:"sessions,omitempty"`
 }
 
 type client struct {
@@ -47,12 +50,12 @@ type session struct {
 	// drop the session from its registry. Set by the hub before the ConPTY starts.
 	onExit func()
 
-	mu           sync.Mutex
-	pty          *conpty.ConPty
-	running      bool
-	closed       bool
-	clients      map[*client]struct{}
-	buffer       *ringBuffer
+	mu      sync.Mutex
+	pty     *conpty.ConPty
+	running bool
+	closed  bool
+	clients map[*client]struct{}
+	buffer  *ringBuffer
 	// Effective (smallest-client) size last applied to the ConPTY. Broadcast to
 	// clients so a larger client can clear ghost output when the shared render
 	// width changes because another client joined or left.
@@ -355,6 +358,19 @@ func (s *session) close() {
 	s.mu.Unlock()
 	if pty != nil {
 		_ = pty.Close()
+	}
+}
+
+// queueToAll queues msg to every client currently attached to this session.
+func (s *session) queueToAll(msg []byte) {
+	s.mu.Lock()
+	clients := make([]*client, 0, len(s.clients))
+	for c := range s.clients {
+		clients = append(clients, c)
+	}
+	s.mu.Unlock()
+	for _, c := range clients {
+		c.queue(msg)
 	}
 }
 

@@ -16,6 +16,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"moona/internal/conpty"
@@ -156,13 +158,20 @@ func spawnDetachedDaemon(opts daemonOptions) error {
 // ----- daemon process -----
 
 type daemon struct {
-	opts      daemonOptions
-	hub       *hub
-	server    *http.Server
-	localURL  string
+	opts     daemonOptions
+	hub      *hub
+	server   *http.Server
+	localURL string
+	errc     chan error
+
+	// mu guards publicURL and tunnel, which the tunnel supervisor goroutine
+	// mutates while state()/status handlers read them.
+	mu        sync.Mutex
 	publicURL string
 	tunnel    *tempTunnel
-	errc      chan error
+
+	closing   atomic.Bool // set when shutting down so the supervisor stops restarting
+	phoneOnce sync.Once   // fires markPhoneConnectedOnce the first time a browser attaches
 }
 
 func runDaemon(args []string) error {
@@ -208,6 +217,14 @@ func runDaemon(args []string) error {
 		return conpty.ErrUnsupported
 	}
 
+	// Apply the user's saved setup (tunnel provider + app token). A never-onboarded
+	// install has no config.json, so uc is zero and behavior matches the historical
+	// Quick Tunnel default.
+	uc, _ := readUserConfig()
+	if opts.token == "" && uc.Token != "" {
+		opts.token = uc.Token
+	}
+
 	d, err := startDaemonServer(opts)
 	if err != nil {
 		// Port already taken? Another daemon likely beat us to it (two terminals
@@ -225,21 +242,37 @@ func runDaemon(args []string) error {
 		return err
 	}
 
-	// Persist discovery info immediately (before the tunnel) so clients can find
-	// us right away; update again once the public URL is known.
-	_ = writeState(d.state())
-
-	if opts.tunnel {
-		if tunnel, publicURL, err := startBestTunnel(opts.port); err != nil {
-			fmt.Fprintln(os.Stderr, "warning:", err)
-		} else {
-			d.tunnel = tunnel
-			d.publicURL = publicURL
-			_ = writeState(d.state())
-		}
+	// For fixed-hostname providers (named CF tunnel, ngrok reserved domain) the
+	// public URL is known from config before the tunnel even connects, so set it
+	// now — otherwise the first client reads the state below before the tunnel is
+	// up and falls back to the local-only URL.
+	if opts.tunnel && tunnelEnabledFor(uc.TunnelProvider) {
+		d.publicURL = knownPublicURL(uc)
 	}
 
-	printDashboard(d.localURL, d.publicURL, opts.host, opts.token, opts.qr)
+	// Persist discovery info immediately (before the tunnel connects) so clients
+	// can find us right away; update again once the live public URL is confirmed.
+	_ = writeState(d.state())
+
+	if opts.tunnel && tunnelEnabledFor(uc.TunnelProvider) {
+		// Start once synchronously so the dashboard below can print the live URL,
+		// then hand the process to a supervisor: tunnel helpers (cloudflared/ngrok/
+		// ssh) can exit on their own — a dropped edge connection, a transient network
+		// blip — while the daemon keeps running, which would silently strand the
+		// public hostname (e.g. Cloudflare error 1033). The supervisor reconnects.
+		tunnel, publicURL, err := startConfiguredTunnel(opts.port, uc)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "warning:", err)
+			// First attempt failed; drop the advertised URL but keep retrying in the
+			// background so a transient failure (e.g. network not up yet) recovers.
+			d.setTunnel(nil, "", true)
+		} else {
+			d.setTunnel(tunnel, publicURL, false)
+		}
+		go d.superviseTunnel(opts.port, uc, tunnel)
+	}
+
+	printDashboard(d.localURL, d.getPublicURL(), opts.host, opts.token, opts.qr)
 
 	if opts.auto {
 		go d.watchIdle()
@@ -288,6 +321,9 @@ func startDaemonServer(opts daemonOptions) (*daemon, error) {
 		localURL: fmt.Sprintf("http://%s:%d", opts.host, opts.port),
 		errc:     make(chan error, 1),
 	}
+	// Push the session list to every browser whenever it changes, so tab bars
+	// update without polling.
+	d.hub.onChange = d.pushSessions
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleIndex)
@@ -322,14 +358,83 @@ func (d *daemon) state() daemonState {
 		Token:     d.opts.token,
 		PID:       os.Getpid(),
 		LocalURL:  d.localURL,
-		PublicURL: d.publicURL,
+		PublicURL: d.getPublicURL(),
 		Started:   nowStamp(),
 	}
 }
 
+// getPublicURL reads the current public URL under the lock (the supervisor
+// goroutine may be updating it).
+func (d *daemon) getPublicURL() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.publicURL
+}
+
+// setTunnel records the current tunnel process + public URL under the lock and
+// persists discovery state. clear drops the advertised URL (the tunnel is down,
+// so the host would only answer with an error); otherwise a non-empty publicURL
+// replaces the current one and an empty one leaves it untouched (keeping a
+// pre-known fixed hostname in place).
+func (d *daemon) setTunnel(t *tempTunnel, publicURL string, clear bool) {
+	d.mu.Lock()
+	d.tunnel = t
+	switch {
+	case clear:
+		d.publicURL = ""
+	case publicURL != "":
+		d.publicURL = publicURL
+	}
+	d.mu.Unlock()
+	_ = writeState(d.state())
+}
+
+// superviseTunnel keeps the configured tunnel alive for the daemon's lifetime.
+// It is seeded with the process from the initial (synchronous) start; whenever
+// that process exits it reconnects with capped backoff, so a dropped tunnel never
+// leaves the public hostname stranded while the daemon keeps serving.
+func (d *daemon) superviseTunnel(port int, uc userConfig, current *tempTunnel) {
+	backoff := time.Second
+	for {
+		if current == nil {
+			if d.closing.Load() {
+				return
+			}
+			tunnel, publicURL, err := startConfiguredTunnel(port, uc)
+			if err != nil {
+				if d.closing.Load() {
+					return
+				}
+				log.Printf("tunnel: %v; reconnecting in %s", err, backoff.Round(time.Second))
+				time.Sleep(backoff)
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
+				continue
+			}
+			backoff = time.Second
+			d.setTunnel(tunnel, publicURL, false)
+			current = tunnel
+		}
+		if current == nil {
+			return // provider produced no process (only happens for local-only)
+		}
+		current.wait() // block until the tunnel helper process exits
+		current = nil
+		if d.closing.Load() {
+			return
+		}
+		log.Printf("tunnel connection dropped; reconnecting")
+	}
+}
+
 func (d *daemon) shutdown() {
-	if d.tunnel != nil {
-		d.tunnel.stop()
+	d.closing.Store(true) // stop the supervisor from restarting the tunnel we kill
+	d.mu.Lock()
+	t := d.tunnel
+	d.mu.Unlock()
+	if t != nil {
+		t.stop()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -408,7 +513,15 @@ func (d *daemon) handleWS(w http.ResponseWriter, r *http.Request) {
 		// primary=1 and become the size authority; browsers conform.
 		primary: r.URL.Query().Get("primary") == "1",
 	}
+	// The first time an actual phone/browser connects, remember it so `moona claude`
+	// stops showing the connect panel on every start.
+	if !c.primary {
+		d.phoneOnce.Do(markPhoneConnectedOnce)
+	}
 	sess.attach(c)
+	// Seed this browser's tab bar with the current session list; subsequent
+	// changes arrive via the onChange broadcast.
+	c.queue(d.sessionsMsg())
 	go writePump(c)
 	// Make the running program redraw its current frame so this freshly attached
 	// (and reset) client shows a clean screen instead of nothing.
@@ -421,7 +534,7 @@ func (d *daemon) handleWS(w http.ResponseWriter, r *http.Request) {
 func (d *daemon) handleInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"localURL":  d.localURL,
-		"publicURL": d.publicURL,
+		"publicURL": d.getPublicURL(),
 		"pid":       os.Getpid(),
 		"sessions":  d.hub.list(),
 	})
@@ -510,6 +623,14 @@ func (d *daemon) handleShutdown(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 }
+
+// sessionsMsg builds a {type:"sessions"} frame carrying the current session list.
+func (d *daemon) sessionsMsg() []byte {
+	return mustJSON(wsMessage{Type: "sessions", Sessions: d.hub.list()})
+}
+
+// pushSessions broadcasts the current session list to every connected browser.
+func (d *daemon) pushSessions() { d.hub.broadcast(d.sessionsMsg()) }
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("content-type", "application/json; charset=utf-8")

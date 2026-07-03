@@ -28,6 +28,14 @@ func runUI(args []string) error {
 		return err
 	}
 
+	// First launch: let the user choose how their phone connects before we spin up
+	// a daemon (so it starts with the right tunnel). Quitting the wizard leaves.
+	if done, err := maybeRunFirstRunSetup(); err != nil {
+		return err
+	} else if !done {
+		return nil
+	}
+
 	st, err := ensureDaemon(daemonOptions{host: *host, port: *port, token: *token, tunnel: *tunnel})
 	if err != nil {
 		return err

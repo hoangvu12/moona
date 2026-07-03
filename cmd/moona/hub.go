@@ -26,6 +26,10 @@ type hub struct {
 	sessions  map[string]*session
 	seq       int
 	lastEmpty time.Time // when the session count last dropped to zero
+	// onChange, if set, is invoked (off-lock) whenever the session set changes, so
+	// the daemon can push the fresh list to every connected browser instead of
+	// making them poll. Must not be called while holding h.mu.
+	onChange func()
 }
 
 func newHub() *hub {
@@ -53,7 +57,18 @@ func (h *hub) createSession(cfg config) (*session, error) {
 		h.remove(id)
 		return nil, err
 	}
+	h.notifyChange()
 	return sess, nil
+}
+
+// notifyChange invokes the onChange hook off-lock. Safe to call with h.mu not held.
+func (h *hub) notifyChange() {
+	h.mu.Lock()
+	cb := h.onChange
+	h.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
 }
 
 func (h *hub) get(id string) *session {
@@ -74,6 +89,21 @@ func (h *hub) remove(id string) {
 	h.mu.Unlock()
 	if ok {
 		sess.close()
+		h.notifyChange()
+	}
+}
+
+// broadcast queues msg to every client across every session. Used to push the
+// session list to all connected browsers on any change.
+func (h *hub) broadcast(msg []byte) {
+	h.mu.Lock()
+	sessions := make([]*session, 0, len(h.sessions))
+	for _, s := range h.sessions {
+		sessions = append(sessions, s)
+	}
+	h.mu.Unlock()
+	for _, s := range sessions {
+		s.queueToAll(msg)
 	}
 }
 

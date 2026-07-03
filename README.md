@@ -53,7 +53,24 @@ moona qr      # QR code for the best phone URL
 moona url     # just the link(s)
 ```
 
-Scan the QR (or open the link) on your phone. The web page shows a tab per session; tap to switch which terminal you are viewing.
+Scan the QR (or open the link) on your phone. The web page shows a tab per session; tap to switch which terminal you are viewing. Tap **＋** in the tab bar to start a new session (default shell, or type a command like `claude`) straight from the phone — no need to walk back to the PC.
+
+## Choosing how your phone connects (`moona setup`)
+
+By default the phone link is a **Cloudflare Quick Tunnel**, whose URL changes every time the daemon restarts — great for a first try, annoying to bookmark. Run the one-time wizard to pick something permanent:
+
+```powershell
+moona setup
+```
+
+| Option | Permanent URL? | What it needs |
+|--------|----------------|---------------|
+| **Quick Tunnel** | no (new URL each restart) | nothing — the zero-setup default |
+| **ngrok** | yes | a free ngrok account: paste one authtoken, plus a reserved `*.ngrok-free.app` domain for a stable link |
+| **Cloudflare (named)** | yes | a domain you own on Cloudflare — moona does the rest: it authorizes Cloudflare (one browser click, skipped if already done), then creates the tunnel and DNS record for you automatically |
+| **Local Wi-Fi only** | n/a | nothing; phone must be on the same network |
+
+Your choice is saved to `%LOCALAPPDATA%\moona\config.json` and reused on every start, so once set the phone URL stops changing. For the public options moona also generates an app token automatically, so the link is never an unauthenticated shell. Re-run `moona setup` any time to change providers (restart the daemon to apply).
 
 ## Everyday commands
 
@@ -65,6 +82,7 @@ moona share                  # start the default shell in a session and attach
 moona share -- codex         # explicit command after --
 moona share --cmd "pwsh.exe -NoLogo"
 
+moona setup                  # choose how your phone connects (stable link, etc.)
 moona ls                     # list active sessions (id, clients, size, command)
 moona attach 2               # attach this terminal to session 2 (reconnect after closing a tab)
 moona kill 2                 # end session 2
@@ -84,7 +102,7 @@ Discovery is a small state file at `%LOCALAPPDATA%\moona\daemon.json` that recor
 
 ## Phone access (tunnel + QR)
 
-The daemon tries these tunnel providers in order and prints the temporary public HTTPS URL + QR: Cloudflare Quick Tunnel (`*.trycloudflare.com`, auto-downloads `cloudflared.exe` if needed), Pinggy (`*.pinggy.link`, non-interactive only), then localhost.run (`*.lhr.life`). Keep the daemon running while you use the link.
+By default (Quick Tunnel) the daemon tries these providers in order and prints the temporary public HTTPS URL + QR: Cloudflare Quick Tunnel (`*.trycloudflare.com`, auto-downloads `cloudflared.exe` if needed), Pinggy (`*.pinggy.link`, non-interactive only), then localhost.run (`*.lhr.life`). These URLs are ephemeral — run [`moona setup`](#choosing-how-your-phone-connects-moona-setup) to switch to ngrok or a Cloudflare named tunnel for a URL that stays the same. Keep the daemon running while you use the link.
 
 Stay local-only (no public tunnel) with:
 

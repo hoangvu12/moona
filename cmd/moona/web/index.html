@@ -20,6 +20,10 @@
     .tab { flex: 0 0 auto; max-width: 44vw; border: 1px solid var(--line); background: #0d1420; color: var(--muted); padding: 5px 10px; border-radius: 8px; font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .tab.active { background: #1b2740; color: var(--text); border-color: #38bdf8; }
     .tab .tid { color: #38bdf8; font-weight: 700; margin-right: 5px; }
+    /* New-session button: always visible so an all-exited phone is never a dead
+       end and you can start work (e.g. claude) without going back to the PC. */
+    #addtab { flex: 0 0 auto; width: 32px; padding: 5px 0; border: 1px solid var(--line); background: #0d1420; color: var(--text); border-radius: 8px; font-size: 16px; font-weight: 700; line-height: 1; }
+    #addtab:active { background: #1b2740; }
     /* The grid is pinned to the native terminal's size (not the device's), so on
        a narrow phone it can be wider than the screen. Allow horizontal panning;
        xterm keeps vertical scroll via its own .xterm-viewport. Pinch-zoom also
@@ -55,23 +59,71 @@
     @media (pointer: fine) and (hover: hover) { #kb { display: none; } }
     /* When the phone's native keyboard is up, hide ours so they never stack. */
     body.osk-up #kb { display: none; }
+    /* Access-code login: shown INSTEAD of a dead terminal when the daemon needs a
+       token we don't have. Scanning the QR provides it automatically; typing the
+       bare URL lands here and asks for the code once. */
+    #login { position: fixed; inset: 0; z-index: 50; display: none; align-items: center; justify-content: center; background: rgba(5,7,10,.94); padding: 24px; }
+    #login.show { display: flex; }
+    .login-card { width: 100%; max-width: 340px; background: var(--bar); border: 1px solid var(--line); border-radius: 16px; padding: 24px 22px; text-align: center; }
+    .login-title { font-weight: 800; font-size: 22px; letter-spacing: .04em; }
+    .login-sub { color: var(--muted); font-size: 13px; margin: 10px 0 18px; line-height: 1.45; }
+    #login-input { width: 100%; padding: 13px 14px; border-radius: 10px; border: 1px solid #334155; background: #0d1420; color: var(--text); font-size: 16px; font-family: inherit; text-align: center; letter-spacing: .04em; }
+    #login-go { width: 100%; margin-top: 12px; padding: 13px; border-radius: 10px; border: 1px solid #334155; background: #0d1420; color: var(--text); font-weight: 700; font-size: 15px; }
+    #login-go:active { transform: translateY(1px); }
+    #login-scan { width: 100%; padding: 13px; border-radius: 10px; border: 1px solid #38bdf8; background: #1b2740; color: var(--text); font-weight: 700; font-size: 15px; }
+    #login-scan:active { transform: translateY(1px); }
+    .login-or { color: var(--muted); font-size: 12px; margin: 14px 0; letter-spacing: .12em; text-transform: uppercase; }
+    #login-err { color: #f38ba8; font-size: 12px; min-height: 16px; margin-top: 10px; }
+    #scanner { position: fixed; inset: 0; z-index: 60; display: none; flex-direction: column; align-items: center; justify-content: center; gap: 18px; background: #000; padding: 20px; }
+    #scanner.show { display: flex; }
+    #scan-video { width: 100%; max-width: 480px; max-height: 68vh; border-radius: 16px; object-fit: cover; background: #05070a; }
+    #scan-hint { color: #e6edf6; font-size: 14px; text-align: center; line-height: 1.4; }
+    #scan-cancel { padding: 12px 28px; border-radius: 10px; border: 1px solid var(--line); background: var(--bar); color: var(--text); font-weight: 700; font-size: 15px; }
+    #scan-cancel:active { transform: translateY(1px); }
   </style>
 </head>
 <body>
   <div id="topbar">
     <span id="brand">moona</span>
     <div id="tabs"></div>
+    <button id="addtab" title="Start a new session">＋</button>
     <span id="status"></span>
   </div>
   <div id="terminal-wrap"><div id="terminal"></div></div>
   <div id="kb"><div id="kb-grid"></div></div>
+
+  <div id="login">
+    <div class="login-card">
+      <div class="login-title">moona</div>
+      <div class="login-sub">Scan the QR shown in your terminal — or enter the access code below.</div>
+      <button id="login-scan">📷&nbsp; Scan QR code</button>
+      <div class="login-or">or</div>
+      <input id="login-input" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="access code" />
+      <button id="login-go">Connect</button>
+      <div id="login-err"></div>
+    </div>
+  </div>
+
+  <div id="scanner">
+    <video id="scan-video" playsinline autoplay muted></video>
+    <div id="scan-hint">Point your camera at the QR code in your terminal</div>
+    <button id="scan-cancel">Cancel</button>
+  </div>
 
   <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
   <script>
     const statusEl = document.getElementById('status');
     const params = new URLSearchParams(location.search);
-    const token = params.get('token') || '';
+    // The app token rides in the URL (?token=...) from the QR/link. Persist it
+    // per-origin so a bookmarked BARE url (e.g. https://moona.nguyenvu.dev) keeps
+    // working without the query string. First tokened visit stores it; later bare
+    // visits reuse it. Clears if the daemon ever rejects it (see below).
+    let token = params.get('token') || '';
+    try {
+      if (token) localStorage.setItem('moona_token', token);
+      else token = localStorage.getItem('moona_token') || '';
+    } catch (e) {}
     const term = new Terminal({
       cursorBlink: true,
       // NOTE: no convertEol. The ConPTY stream carries its own CR/LF and cursor
@@ -134,22 +186,55 @@
       connect();
     }
 
-    async function refreshSessions() {
-      let list;
-      try {
-        const r = await fetch('/api/sessions' + apiQuery());
-        if (!r.ok) throw new Error('http ' + r.status);
-        list = await r.json();
-      } catch (e) { return; }
+    // Reconcile the tab bar with a session list (from an HTTP fetch or a pushed
+    // {type:'sessions'} frame). Keeps the current selection if it still exists;
+    // otherwise falls back to the first session, or the empty state.
+    function applySessions(list) {
       sessions = Array.isArray(list) ? list : [];
-      // Keep the current selection if it still exists; otherwise fall back to the
-      // first session (or nothing).
       if (!activeId || !sessions.find(s => s.id === activeId)) {
         const first = sessions[0];
         if (first) { selectSession(first.id); }
-        else { activeId = null; if (ws) { try { ws.close(); } catch (e) {} ws = null; } setStatus('no sessions — run "moona claude"'); }
+        else { activeId = null; if (ws) { try { ws.close(); } catch (e) {} ws = null; } setStatus('no sessions — tap ＋ to start one'); }
       }
       renderTabs();
+    }
+    async function refreshSessions() {
+      try {
+        const r = await fetch('/api/sessions' + apiQuery());
+        if (r.status === 401) {
+          // We have no valid token. Instead of a dead terminal, show a friendly
+          // "enter access code" prompt. A wrong stored token is cleared so a fresh
+          // code (or a QR scan) can replace it.
+          const hadToken = !!token;
+          try { localStorage.removeItem('moona_token'); } catch (e) {}
+          token = '';
+          showLogin(hadToken ? 'That code was not accepted — try again.' : '');
+          return;
+        }
+        if (!r.ok) throw new Error('http ' + r.status);
+        applySessions(await r.json());
+      } catch (e) { return; }
+    }
+    // Start a new session from the phone. The daemon spawns it (default shell, or a
+    // command you type — e.g. "claude"), so you never have to walk back to the PC.
+    async function addSession() {
+      let cmd;
+      try { cmd = window.prompt('Command to run (blank = shell):', 'claude'); }
+      catch (e) { cmd = ''; }
+      if (cmd === null) return; // cancelled
+      setStatus('starting...');
+      try {
+        const r = await fetch('/api/sessions' + apiQuery(), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ cmd: (cmd || '').trim() })
+        });
+        if (!r.ok) throw new Error('http ' + r.status);
+        const out = await r.json();
+        await refreshSessions();
+        if (out && out.id) selectSession(out.id);
+        setStatus('started session ' + ((out && out.id) || ''));
+      } catch (e) { setStatus('could not start session'); }
     }
     function send(msg) {
       if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
@@ -245,6 +330,7 @@
               try { term.scrollToBottom(); } catch (e) {}
             }
           }
+          else if (msg.type === 'sessions') { applySessions(msg.sessions || []); }
           else if (msg.type === 'status') { setStatus(msg.message || 'connected'); if ((msg.message || '').indexOf('exited') >= 0) refreshSessions(); }
           else if (msg.type === 'error') { setStatus(msg.message || 'error'); term.writeln('\r\n[moona] ' + (msg.message || 'error')); }
         } catch (e) {}
@@ -418,10 +504,130 @@
     })();
 
     fitAndResize();
-    // Discover sessions, connect to one, and keep the tab bar fresh so sessions
-    // started/stopped from any terminal show up here within a few seconds.
+    // ---- Access-code login (shown on 401 when we have no valid token) ----
+    const loginEl = document.getElementById('login');
+    const loginInput = document.getElementById('login-input');
+    const loginErr = document.getElementById('login-err');
+    function showLogin(msg) {
+      if (loginErr) loginErr.textContent = msg || '';
+      if (loginEl) loginEl.classList.add('show');
+      setTimeout(() => { try { loginInput.focus(); } catch (e) {} }, 50);
+    }
+    function hideLogin() { if (loginEl) loginEl.classList.remove('show'); }
+    // applyToken stores an access code (from typing OR scanning) and reconnects.
+    function applyToken(code) {
+      token = code;
+      try { localStorage.setItem('moona_token', code); } catch (e) {}
+      hideLogin();
+      setStatus('connecting...');
+      refreshSessions().then(() => { if (activeId) connect(); });
+    }
+    function submitLogin() {
+      const code = (loginInput.value || '').trim();
+      if (!code) { showLogin('Enter the code.'); return; }
+      applyToken(code);
+    }
+    document.getElementById('login-go').addEventListener('click', submitLogin);
+    loginInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitLogin(); });
+
+    // ---- Scan-to-connect: read the terminal QR with the phone camera and pull
+    // the access code out of it, so nobody has to type the 32-char token. The QR
+    // encodes the full URL (…/?token=CODE); we decode it in-page with jsQR (loaded
+    // lazily, same CDN as xterm) and feed the token straight into applyToken().
+    const scannerEl = document.getElementById('scanner');
+    const scanVideo = document.getElementById('scan-video');
+    const scanHint = document.getElementById('scan-hint');
+    const scanCanvas = document.createElement('canvas');
+    let scanStream = null, scanRAF = 0, jsqrPromise = null;
+
+    function loadJsQR() {
+      if (window.jsQR) return Promise.resolve(window.jsQR);
+      if (jsqrPromise) return jsqrPromise;
+      jsqrPromise = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js';
+        s.onload = () => resolve(window.jsQR);
+        s.onerror = () => { jsqrPromise = null; reject(new Error('load failed')); };
+        document.head.appendChild(s);
+      });
+      return jsqrPromise;
+    }
+
+    // extractToken pulls the access code out of whatever the QR decodes to: a full
+    // moona URL (?token=…), a bare "token=…" fragment, or the raw code itself.
+    function extractToken(text) {
+      if (!text) return '';
+      try { const q = new URL(text, location.origin).searchParams.get('token'); if (q) return q; } catch (e) {}
+      const m = String(text).match(/token=([A-Za-z0-9._~-]+)/);
+      if (m) return m[1];
+      const s = String(text).trim();
+      if (/^[A-Za-z0-9]{8,}$/.test(s)) return s;
+      return '';
+    }
+
+    function stopScan() {
+      scannerEl.classList.remove('show');
+      if (scanRAF) { cancelAnimationFrame(scanRAF); scanRAF = 0; }
+      if (scanStream) { scanStream.getTracks().forEach(t => t.stop()); scanStream = null; }
+      scanVideo.srcObject = null;
+    }
+
+    function onScanResult(text) {
+      const t = extractToken(text);
+      stopScan();
+      if (!t) { showLogin("That QR didn't contain an access code — try again, or type the code."); return; }
+      applyToken(t);
+    }
+
+    async function startScan() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        showLogin("This browser can't open the camera — type the code instead."); return;
+      }
+      let jsQRfn;
+      try { jsQRfn = await loadJsQR(); }
+      catch (e) { showLogin("Couldn't load the scanner — type the code instead."); return; }
+      try {
+        scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+      } catch (e) {
+        showLogin('Camera blocked — allow camera access, or type the code.'); return;
+      }
+      scanVideo.srcObject = scanStream;
+      try { await scanVideo.play(); } catch (e) {}
+      scannerEl.classList.add('show');
+      const ctx = scanCanvas.getContext('2d', { willReadFrequently: true });
+      const tick = () => {
+        if (!scannerEl.classList.contains('show')) return;
+        if (scanVideo.readyState === scanVideo.HAVE_ENOUGH_DATA && scanVideo.videoWidth) {
+          const w = scanVideo.videoWidth, h = scanVideo.videoHeight;
+          scanCanvas.width = w; scanCanvas.height = h;
+          ctx.drawImage(scanVideo, 0, 0, w, h);
+          let img = null;
+          try { img = ctx.getImageData(0, 0, w, h); } catch (e) {}
+          if (img) {
+            const code = jsQRfn(img.data, w, h, { inversionAttempts: 'attemptBoth' });
+            if (code && code.data) { onScanResult(code.data); return; }
+          }
+        }
+        scanRAF = requestAnimationFrame(tick);
+      };
+      scanRAF = requestAnimationFrame(tick);
+    }
+
+    document.getElementById('login-scan').addEventListener('click', startScan);
+    document.getElementById('scan-cancel').addEventListener('click', () => { stopScan(); showLogin(''); });
+
+    const addtabEl = document.getElementById('addtab');
+    if (addtabEl) addtabEl.addEventListener('click', addSession);
+
+    // Discover sessions once, then connect. While connected, tab changes arrive as
+    // pushed {type:'sessions'} frames over the WebSocket (no polling — this keeps a
+    // metered tunnel like ngrok well under its request cap). We only fall back to
+    // polling while there is NO open socket (e.g. the empty state), so a session
+    // started on the PC still appears on an idle phone.
     refreshSessions().then(() => { if (activeId) connect(); });
-    setInterval(refreshSessions, 3000);
+    setInterval(() => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) refreshSessions();
+    }, 6000);
   </script>
 </body>
 </html>

@@ -29,6 +29,8 @@ func run(args []string) error {
 	case "ui", "dash", "tui", "manage":
 		maybeAutoUpdate(args)
 		return runUI(args[1:])
+	case "setup", "onboard":
+		return runSetup(args[1:])
 	case "share", "serve":
 		maybeAutoUpdate(args)
 		return runShare(args[1:])
@@ -71,6 +73,7 @@ Usage:
   moona share -- codex           start codex in a session
   moona share --cmd "pwsh.exe"   start a raw command line in a session
 
+  moona setup                    choose how your phone connects (stable link, etc.)
   moona ui                       open the dashboard (same as bare moona)
   moona daemon [flags]           run the background switchboard (link + QR live here)
   moona daemon stop              stop the switchboard and all sessions

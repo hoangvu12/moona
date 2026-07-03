@@ -10,5 +10,8 @@ moona.exe~
 # Tool caches
 .mimir/
 
+# Isolated test home (moona setup/daemon state during local testing)
+.testhome/
+
 # GoReleaser output
 dist/
