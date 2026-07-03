@@ -3,6 +3,7 @@ moona.exe
 moona.exe~
 *.exe
 *.exe~
+*.exe.old
 
 # Logs / scratch
 *.log
