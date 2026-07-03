@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Moona Terminal</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+  <style>
+    :root { color-scheme: dark; --bar: #111827; --line: #243042; --text: #d7e0ee; --muted: #95a3b8; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #05070a; color: var(--text); font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { display: flex; flex-direction: column; }
+    #topbar { min-height: 42px; display: flex; align-items: center; gap: 8px; padding: 6px 8px calc(6px + env(safe-area-inset-top)); background: var(--bar); border-bottom: 1px solid var(--line); }
+    #brand { font-weight: 700; letter-spacing: .02em; }
+    #status { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* The grid is pinned to the native terminal's size (not the device's), so on
+       a narrow phone it can be wider than the screen. Allow horizontal panning;
+       xterm keeps vertical scroll via its own .xterm-viewport. Pinch-zoom also
+       works (viewport meta permits user scaling). */
+    #terminal-wrap { flex: 1; min-height: 0; padding: 8px 8px 4px; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; }
+    #terminal { width: 100%; height: 100%; }
+    #keys { display: flex; gap: 6px; overflow-x: auto; padding: 6px 8px calc(8px + env(safe-area-inset-bottom)); background: var(--bar); border-top: 1px solid var(--line); -webkit-overflow-scrolling: touch; }
+    button { flex: 0 0 auto; border: 1px solid #334155; background: #182235; color: var(--text); padding: 9px 12px; border-radius: 10px; font-weight: 650; font-size: 13px; }
+    button:active { transform: translateY(1px); background: #24324b; }
+    .xterm { height: 100%; }
+    .xterm .xterm-viewport { overflow-y: auto; }
+    @media (max-width: 640px) {
+      #topbar { min-height: 38px; }
+      #brand { font-size: 13px; }
+      button { padding: 9px 11px; }
+      #terminal-wrap { padding: 6px 6px 2px; }
+    }
+    /* --- JuiceSSH-style grid keyboard (mobile) --- */
+    #kb { background: var(--bar); border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom); }
+    /* Cap the keyboard so the terminal always keeps the majority of the screen;
+       the grid scrolls internally if the keys don't all fit. */
+    #kb-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; padding: 6px 8px; max-height: 38vh; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+    .kb-key { position: relative; display: flex; align-items: center; justify-content: center; text-align: center; background: transparent; border: 0; color: var(--text); font-family: inherit; font-size: 16px; font-weight: 600; line-height: 1.15; padding: 12px 6px; border-radius: 12px; -webkit-user-select: none; user-select: none; touch-action: manipulation; white-space: pre-line; }
+    .kb-key:active { background: #1c2740; }
+    .kb-key.sym { color: var(--muted); font-size: 18px; }
+    .kb-key.wide { grid-column: 1 / -1; color: var(--muted); font-size: 15px; }
+    /* Modifier keys show an underline that lights up when armed/locked. */
+    .kb-key.mod::after { content: ''; position: absolute; bottom: 9px; left: 50%; transform: translateX(-50%); width: 20px; height: 2px; border-radius: 2px; background: #3a465c; }
+    .kb-key.mod.armed::after { background: #38bdf8; }
+    .kb-key.mod.locked::after { background: #0ea5e9; height: 3px; }
+    .kb-divider { grid-column: 1 / -1; height: 1px; background: var(--line); margin: 4px; opacity: .6; }
+    /* Desktop drives a real keyboard: don't show the on-screen one at all. */
+    @media (pointer: fine) and (hover: hover) { #kb { display: none; } }
+    /* When the phone's native keyboard is up, hide ours so they never stack. */
+    body.osk-up #kb { display: none; }
+  </style>
+</head>
+<body>
+  <div id="terminal-wrap"><div id="terminal"></div></div>
+  <div id="kb"><div id="kb-grid"></div></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+  <script>
+    const statusEl = document.getElementById('status');
+    const params = new URLSearchParams(location.search);
+    const token = params.get('token') || '';
+    const term = new Terminal({
+      cursorBlink: true,
+      // NOTE: no convertEol. The ConPTY stream carries its own CR/LF and cursor
+      // positioning; rewriting \n to \r\n (as convertEol does) mangles a
+      // repainting TUI's output over time. The real console (moona attach)
+      // renders the same bytes cleanly precisely because it does not do this.
+      fontFamily: 'Cascadia Mono, Consolas, Menlo, Monaco, monospace',
+      fontSize: window.innerWidth < 640 ? 13 : 14,
+      theme: { background: '#05070a', foreground: '#d7e0ee', cursor: '#f8fafc', selectionBackground: '#334155' },
+      allowProposedApi: true
+    });
+    const fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(document.getElementById('terminal'));
+    term.focus();
+
+    let ws = null;
+    let reconnectTimer = null;
+    let resizeTimer = null;
+
+    function setStatus(text) { if (statusEl) statusEl.textContent = text; }
+    function wsURL() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const suffix = token ? ('?token=' + encodeURIComponent(token)) : '';
+      return proto + '//' + location.host + '/ws' + suffix;
+    }
+    function send(msg) {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+    }
+    function sendInput(data) { send({ type: 'input', data }); }
+    // The size we last REQUESTED from the server (our natural fit). This is only
+    // a request: the server picks the effective size (min across all clients)
+    // and echoes it back via a {type:'size'} message, which is the ONLY thing
+    // that actually resizes our grid. See the size handler below.
+    let lastReqCols = 0, lastReqRows = 0;
+    // The effective grid the server told us the app is rendering at. xterm's
+    // grid is kept EXACTLY equal to this at all times, because Claude Code's
+    // renderer emits purely cursor-relative deltas against a screen whose
+    // dimensions == the ConPTY size. If our grid diverges from the ConPTY even
+    // by one row, every incremental frame's cursor math drifts and the output
+    // rots "after a moment". So the server is authoritative on grid size.
+    let lastEffCols = 0, lastEffRows = 0;
+    function fitAndResize() {
+      // Measure our natural fit WITHOUT mutating the grid (proposeDimensions
+      // does not resize; fitAddon.fit() would, and that must never race the
+      // server's authoritative size). Send it as a request only.
+      let dims;
+      try { dims = fitAddon.proposeDimensions(); } catch (e) {}
+      if (!dims || !dims.cols || !dims.rows) return;
+      if (dims.cols === lastReqCols && dims.rows === lastReqRows) return;
+      lastReqCols = dims.cols;
+      lastReqRows = dims.rows;
+      send({ type: 'resize', cols: dims.cols, rows: dims.rows });
+    }
+    // On phones the grid is pinned to the (often larger) native-terminal size,
+    // so at a normal font it overflows and the bottom row hides behind the
+    // keyboard. Shrink the font just enough that the whole authoritative grid
+    // fits the visible area — never larger than a readable default.
+    const IS_MOBILE = matchMedia('(pointer: coarse)').matches;
+    const MOBILE_MAX_FONT = window.innerWidth < 640 ? 13 : 14;
+    function fitFontToGrid() {
+      if (!IS_MOBILE || !lastEffCols || !lastEffRows) return;
+      const wrap = document.getElementById('terminal-wrap');
+      const h = wrap.clientHeight;
+      if (h < 20) return;
+      // Fit the ROWS to the visible height so every row (incl. the prompt) shows;
+      // width is allowed to overflow and pan horizontally, as before. 1.34 is a
+      // conservative cell-height-per-font-px so it fits with a small margin.
+      let fs = h / (lastEffRows * 1.34);
+      fs = Math.max(6, Math.min(fs, MOBILE_MAX_FONT));
+      fs = Math.round(fs * 2) / 2;
+      if (Math.abs((term.options.fontSize || 0) - fs) >= 0.5) {
+        term.options.fontSize = fs;
+        try { term.resize(lastEffCols, lastEffRows); } catch (e) {}
+      }
+      try { term.scrollToBottom(); } catch (e) {}
+    }
+    function scheduleResize() {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => { fitAndResize(); fitFontToGrid(); }, 80);
+    }
+    function connect() {
+      clearTimeout(reconnectTimer);
+      setStatus('connecting...');
+      ws = new WebSocket(wsURL());
+      ws.onopen = () => { setStatus('connected'); lastReqCols = 0; lastReqRows = 0; lastEffCols = 0; lastEffRows = 0; fitAndResize(); term.focus(); };
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'output') term.write(msg.data || '');
+          else if (msg.type === 'reset') {
+            // Server dropped the raw replay; start from a clean slate and let the
+            // app repaint the current frame. Reset trackers so we re-request.
+            term.reset();
+            lastReqCols = 0; lastReqRows = 0; lastEffCols = 0; lastEffRows = 0;
+          }
+          else if (msg.type === 'size') {
+            // Authoritative grid size from the server (min across all clients).
+            // Force our xterm grid to EXACTLY match the ConPTY so Claude Code's
+            // cursor-relative deltas stay locked and don't drift over time.
+            if (msg.cols && msg.rows && (msg.cols !== lastEffCols || msg.rows !== lastEffRows)) {
+              const widthChanged = lastEffCols !== 0 && msg.cols !== lastEffCols;
+              term.resize(msg.cols, msg.rows);
+              // A repainting TUI writes to the main screen, so old frames sit in
+              // scrollback. On a WIDTH change xterm reflows that scrollback and
+              // garbles it (the frames were never soft-wrapped). Drop it; the app
+              // repaints the current frame. Height-only changes keep column layout
+              // intact, so we preserve history to avoid wiping it on mobile scroll.
+              if (widthChanged) term.clear();
+              lastEffCols = msg.cols;
+              lastEffRows = msg.rows;
+              // The grid may be taller/wider than the visible area (it is pinned
+              // to the ConPTY/native-terminal size). On mobile, shrink the font so
+              // it all fits; then keep the live bottom row — the prompt — in view.
+              fitFontToGrid();
+              try { term.scrollToBottom(); } catch (e) {}
+            }
+          }
+          else if (msg.type === 'status') setStatus(msg.message || 'connected');
+          else if (msg.type === 'error') { setStatus(msg.message || 'error'); term.writeln('\r\n[moona] ' + (msg.message || 'error')); }
+        } catch (e) {}
+      };
+      ws.onclose = () => { setStatus('disconnected; reconnecting...'); reconnectTimer = setTimeout(connect, 1200); };
+      ws.onerror = () => { setStatus('connection error'); };
+    }
+
+    // ---- Mobile keyboard: sticky modifiers + special keys (Termius-style) ----
+    const ESC = String.fromCharCode(27);
+    const mod = { ctrl: { on: false, lock: false }, alt: { on: false, lock: false } };
+
+    function renderMods() {
+      for (const name of ['ctrl', 'alt']) {
+        const el = document.getElementById('mod-' + name);
+        if (!el) continue;
+        el.classList.toggle('armed', mod[name].on && !mod[name].lock);
+        el.classList.toggle('locked', mod[name].lock);
+      }
+    }
+    // Tap cycle: off -> armed (one-shot) -> locked -> off.
+    function cycleMod(name) {
+      const s = mod[name];
+      if (!s.on) { s.on = true; s.lock = false; }
+      else if (!s.lock) { s.lock = true; }
+      else { s.on = false; s.lock = false; }
+      renderMods();
+    }
+    function clearOneShot() {
+      let changed = false;
+      for (const name of ['ctrl', 'alt']) {
+        if (mod[name].on && !mod[name].lock) { mod[name].on = false; changed = true; }
+      }
+      if (changed) renderMods();
+    }
+    // Map a character under Ctrl to its ASCII control code (Ctrl+A -> 0x01 ...).
+    function ctrlByte(ch) {
+      let c = ch.charCodeAt(0);
+      if (c >= 97 && c <= 122) c -= 32;                          // lower -> upper
+      if (c >= 64 && c <= 95) return String.fromCharCode(c - 64); // @ A-Z [ backslash ] ^ _
+      if (c === 32) return String.fromCharCode(0);                // Ctrl+Space -> NUL
+      return ch;
+    }
+    function applyMods(ch) {
+      let out = ch;
+      if (mod.ctrl.on) out = ctrlByte(ch);
+      if (mod.alt.on) out = ESC + out; // Alt = ESC prefix (xterm meta convention)
+      return out;
+    }
+    // A single printable char from the OS keyboard or a tapped symbol key.
+    function typeChar(ch) { sendInput(applyMods(ch)); clearOneShot(); }
+    // A fixed control sequence (Esc, Tab, arrows, Fn...). Alt still prepends ESC.
+    function sendSeq(seq) { sendInput(mod.alt.on ? ESC + seq : seq); clearOneShot(); }
+
+    // Route OS soft-keyboard input through the modifier logic. Single chars get
+    // Ctrl/Alt applied; multi-char input (paste, IME, or an ANSI sequence xterm
+    // produced for a hardware key) passes through untouched.
+    term.onData((data) => {
+      if (data.length === 1 && (mod.ctrl.on || mod.alt.on)) { typeChar(data); return; }
+      clearOneShot();
+      sendInput(data);
+    });
+
+    // ---- Key tables ----
+    const BS = String.fromCharCode(92); // backslash symbol
+    const SYMBOLS = ['/', '-', '_', '~', '|', '&', ';', ':', '$', '#', '%', '*', '?', '!', '^', '=', '+', '.', ',', '@', '"', "'", '`', BS, '(', ')', '[', ']', '{', '}', '<', '>'];
+    const SPECIALS = [
+      ['Home', ESC + '[H'], ['End', ESC + '[F'],
+      ['PgUp', ESC + '[5~'], ['PgDn', ESC + '[6~'],
+      ['Del', ESC + '[3~'], ['Ins', ESC + '[2~'],
+    ];
+    const FKEYS = [
+      ['F1', ESC + 'OP'], ['F2', ESC + 'OQ'], ['F3', ESC + 'OR'], ['F4', ESC + 'OS'],
+      ['F5', ESC + '[15~'], ['F6', ESC + '[17~'], ['F7', ESC + '[18~'], ['F8', ESC + '[19~'],
+      ['F9', ESC + '[20~'], ['F10', ESC + '[21~'], ['F11', ESC + '[23~'], ['F12', ESC + '[24~'],
+    ];
+    const ARROWS = { up: ESC + '[A', down: ESC + '[B', left: ESC + '[D', right: ESC + '[C' };
+
+    // Fire on pointerdown + preventDefault so a tap never steals focus from
+    // xterm's hidden textarea (which would dismiss the phone keyboard).
+    function makeKey(label, opts) {
+      opts = opts || {};
+      const b = document.createElement('button');
+      b.className = 'kb-key' + (opts.cls ? ' ' + opts.cls : '');
+      b.textContent = label;
+      if (opts.id) b.id = opts.id;
+      if (opts.useClick) {
+        b.addEventListener('click', () => { if (opts.onTap) opts.onTap(); term.focus(); });
+      } else {
+        b.addEventListener('pointerdown', (e) => { e.preventDefault(); if (opts.onTap) opts.onTap(); term.focus(); });
+      }
+      return b;
+    }
+    // Press-and-hold auto-repeat, used for arrows.
+    function makeRepeatKey(label, seq) {
+      const b = document.createElement('button');
+      b.className = 'kb-key';
+      b.textContent = label;
+      let delayT = null, repT = null;
+      const stop = () => { clearTimeout(delayT); clearInterval(repT); delayT = repT = null; };
+      b.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        sendSeq(seq);
+        delayT = setTimeout(() => { repT = setInterval(() => sendInput(seq), 90); }, 350);
+        term.focus();
+      });
+      b.addEventListener('pointerup', stop);
+      b.addEventListener('pointerleave', stop);
+      b.addEventListener('pointercancel', stop);
+      return b;
+    }
+
+    const kbGrid = document.getElementById('kb-grid');
+    const addKey = (node) => kbGrid.appendChild(node);
+    const addDivider = () => { const d = document.createElement('div'); d.className = 'kb-divider'; kbGrid.appendChild(d); };
+
+    // Row 1: modifiers, Esc, Tab.
+    addKey(makeKey('Ctrl', { id: 'mod-ctrl', cls: 'mod', onTap: () => cycleMod('ctrl') }));
+    addKey(makeKey('Alt', { id: 'mod-alt', cls: 'mod', onTap: () => cycleMod('alt') }));
+    addKey(makeKey('Esc', { onTap: () => sendSeq(ESC) }));
+    addKey(makeKey('Tab', { onTap: () => sendSeq(String.fromCharCode(9)) }));
+    // Row 2: arrows (press-and-hold to auto-repeat).
+    addKey(makeRepeatKey('←', ARROWS.left));
+    addKey(makeRepeatKey('↑', ARROWS.up));
+    addKey(makeRepeatKey('↓', ARROWS.down));
+    addKey(makeRepeatKey('→', ARROWS.right));
+    addDivider();
+    // Navigation + editing: Home End PgUp PgDn Del Ins, then ^C and Paste.
+    for (const sp of SPECIALS) addKey(makeKey(sp[0], { onTap: () => sendSeq(sp[1]) }));
+    addKey(makeKey('^C', { onTap: () => sendInput(String.fromCharCode(3)) }));
+    addKey(makeKey('Paste', { useClick: true, onTap: async () => {
+      try { sendInput(await navigator.clipboard.readText()); setStatus('pasted'); }
+      catch (e) { setStatus('clipboard blocked by browser'); }
+    } }));
+    // Alt+V (ESC v) — Claude Code's "paste image from clipboard" shortcut.
+    addKey(makeKey('Alt+V', { onTap: () => sendInput(ESC + 'v') }));
+    // Full-width key that raises the phone's native keyboard for free-text
+    // typing. Uses click (no preventDefault) so focusing xterm's textarea is
+    // allowed to open the soft keyboard; the visualViewport watcher then hides
+    // this panel while it is up.
+    addKey(makeKey('⌨  keyboard', { cls: 'wide', useClick: true, onTap: () => term.focus() }));
+    addDivider();
+    // Symbols.
+    for (const s of SYMBOLS) addKey(makeKey(s, { cls: 'sym', onTap: () => typeChar(s) }));
+    addDivider();
+    // Function keys.
+    for (const f of FKEYS) addKey(makeKey(f[0], { onTap: () => sendSeq(f[1]) }));
+
+    window.addEventListener('resize', scheduleResize);
+    window.addEventListener('orientationchange', scheduleResize);
+    renderMods();
+
+    // Pin the app to the *visible* viewport. The native keyboard covers the
+    // bottom of the screen without shrinking the layout viewport, so without
+    // this the terminal (and its live prompt) hides behind it. Match the body
+    // height to visualViewport, hide our on-screen keyboard while the native one
+    // is up (body.osk-up), and keep the prompt scrolled into view.
+    (function syncViewport() {
+      const vv = window.visualViewport;
+      if (!vv) return;
+      const apply = () => {
+        document.body.style.height = vv.height + 'px';
+        const covered = window.innerHeight - vv.height - vv.offsetTop;
+        document.body.classList.toggle('osk-up', covered > 120);
+        scheduleResize();
+        try { term.scrollToBottom(); } catch (e) {}
+      };
+      vv.addEventListener('resize', apply);
+      vv.addEventListener('scroll', apply);
+      apply();
+    })();
+
+    fitAndResize();
+    connect();
+  </script>
+</body>
+</html>
