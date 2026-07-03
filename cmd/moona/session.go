@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,12 +17,23 @@ import (
 	"moona/internal/conpty"
 )
 
+// sessionBufferBytes is how much raw ConPTY output each session retains for
+// replay to a newly attached browser. A browser client has no scrollback of its
+// own (it only ever received the live stream), so this buffer is the history a
+// phone sees when it scrolls up. Sized generously so it comfortably exceeds a
+// typical native-console scrollback; it is gzip-compressed before sending, so the
+// on-the-wire cost of a large value is small.
+const sessionBufferBytes = 8 << 20 // 8 MiB
+
 type wsMessage struct {
 	Type    string `json:"type"`
 	Data    string `json:"data,omitempty"`
 	Cols    int    `json:"cols,omitempty"`
 	Rows    int    `json:"rows,omitempty"`
 	Message string `json:"message,omitempty"`
+	// Enc marks how Data is encoded when it is not a plain UTF-8 terminal string.
+	// Used by the {type:"replay"} history frame, whose Data is base64(gzip(bytes)).
+	Enc string `json:"enc,omitempty"`
 	// Sessions carries the daemon's current session list on a {type:"sessions"}
 	// frame, so browsers refresh their tab bar from a push instead of polling.
 	Sessions []sessionInfo `json:"sessions,omitempty"`
@@ -68,7 +82,7 @@ func newSession(cfg config) *session {
 		cfg:     cfg,
 		command: cfg.commandLine,
 		clients: make(map[*client]struct{}),
-		buffer:  newRingBuffer(512 * 1024),
+		buffer:  newRingBuffer(sessionBufferBytes),
 	}
 }
 
@@ -100,24 +114,58 @@ func (s *session) ensureStarted() error {
 }
 
 func (s *session) attach(c *client) {
+	// Everything here runs under s.mu, including queueing the client's opening
+	// frames. This is what makes the replay correct: readLoop also holds s.mu when
+	// it both records output into the buffer AND picks which clients to deliver it
+	// to. Adding c to s.clients, snapshotting the buffer, and enqueuing the replay
+	// as one locked step guarantees c's history snapshot and its live stream meet
+	// exactly at the seam -- no bytes are dropped between them and none are sent
+	// twice, and no live frame can reach c's channel ahead of the history.
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.clients[c] = struct{}{}
 	effCols, effRows := s.lastEffCols, s.lastEffRows
-	s.mu.Unlock()
 
-	// Do NOT replay the raw output ring buffer. For a full-screen TUI (Claude
-	// Code, etc.) it is a stream of cursor-positioned frame updates; replaying it
-	// from an arbitrary midpoint into a fresh terminal produces garbled scrollback
-	// -- the symptom seen when simply opening the page, no second client needed.
-	// Instead reset the client, then force the app to repaint its current frame
-	// (see forceRepaint in handleWS) so the new client gets a clean screen.
+	// Start the client from a clean slate...
 	c.queue(mustJSON(wsMessage{Type: "reset"}))
-	// Tell the new client the width the app is currently rendering at, so it can
-	// match/ignore ghost output instead of assuming its own fitted size.
+	// ...pin it to the authoritative grid BEFORE the replay, so the browser
+	// reconstructs the history at the same width the native terminal used and its
+	// line wrapping / scrollback come out identical (not reflowed to the phone).
 	if effCols > 0 && effRows > 0 {
 		c.queue(mustJSON(wsMessage{Type: "size", Cols: effCols, Rows: effRows}))
 	}
+	// Replay the retained scrollback to browser clients only. Unlike a naive
+	// mid-stream replay, this is written into an xterm already sized to the ConPTY,
+	// so the same cursor-relative frame updates land where they did originally and
+	// only genuinely-scrolled lines remain as history -- a faithful copy of what the
+	// desktop console shows. A native terminal (primary) keeps its own real console
+	// scrollback and ignores this frame, so don't spend the gzip on it.
+	if !c.primary {
+		if frame := replayFrame(s.buffer.BytesFromLine()); frame != nil {
+			c.queue(frame)
+		}
+	}
 	c.queue(mustJSON(wsMessage{Type: "status", Message: "connected"}))
+}
+
+// replayFrame packages retained session output into a {type:"replay"} message:
+// gzip-compressed (terminal text compresses heavily) then base64'd so it rides in
+// the same JSON text channel as every other frame. Returns nil for an empty
+// buffer so the caller can skip it. Built while s.mu is held; gzip of a few MiB is
+// a few tens of ms, a one-time cost on the (infrequent) attach path.
+func replayFrame(raw []byte) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	var buf bytes.Buffer
+	zw, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	_, _ = zw.Write(raw)
+	_ = zw.Close()
+	return mustJSON(wsMessage{
+		Type: "replay",
+		Enc:  "gzip",
+		Data: base64.StdEncoding.EncodeToString(buf.Bytes()),
+	})
 }
 
 func (s *session) detach(c *client) {

@@ -25,16 +25,29 @@
     #addtab { flex: 0 0 auto; width: 32px; padding: 5px 0; border: 1px solid var(--line); background: #0d1420; color: var(--text); border-radius: 8px; font-size: 16px; font-weight: 700; line-height: 1; }
     #addtab:active { background: #1b2740; }
     /* The grid is pinned to the native terminal's size (not the device's), so on
-       a narrow phone it can be wider than the screen. Allow horizontal panning;
-       xterm keeps vertical scroll via its own .xterm-viewport. Pinch-zoom also
-       works (viewport meta permits user scaling). */
-    #terminal-wrap { flex: 1; min-height: 0; padding: 8px 8px 4px; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; }
+       a narrow phone it can be wider than the screen; this wrap owns HORIZONTAL
+       panning (overflow-x). VERTICAL scrolling is deliberately NOT native: xterm's
+       Viewport snaps scrollTop to a whole-row boundary on every scroll frame
+       (Viewport.ts _innerRefresh), which cancels the browser's fling momentum the
+       instant you lift your finger — so a fast swipe "scrolls a bit then stops".
+       We therefore forbid native pan-y (touch-action omits pan-y) and drive
+       vertical scrolling ourselves with a real inertial handler (see enableInertialTouchScroll).
+       Keep pan-x for the wide grid and pinch-zoom for readability. */
+    #terminal-wrap { flex: 1; min-height: 0; padding: 8px 8px 4px; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; touch-action: pan-x pinch-zoom; }
     #terminal { width: 100%; height: 100%; }
     #keys { display: flex; gap: 6px; overflow-x: auto; padding: 6px 8px calc(8px + env(safe-area-inset-bottom)); background: var(--bar); border-top: 1px solid var(--line); -webkit-overflow-scrolling: touch; }
     button { flex: 0 0 auto; border: 1px solid #334155; background: #182235; color: var(--text); padding: 9px 12px; border-radius: 10px; font-weight: 650; font-size: 13px; }
     button:active { transform: translateY(1px); background: #24324b; }
     .xterm { height: 100%; }
-    .xterm .xterm-viewport { overflow-y: auto; }
+    /* Native, momentum vertical scroll (smooth on Android; a manual JS handler
+       stutters and has no inertia). touch-action:pan-x pan-y lets a vertical swipe
+       scroll this viewport while a horizontal swipe chains up to #terminal-wrap for
+       column panning. overscroll-behavior:contain stops a scroll from leaking to
+       the page (address-bar wobble). -webkit-overflow-scrolling gives iOS inertia. */
+    /* overflow-y:auto keeps the scroll-area xterm needs; touch-action omits pan-y
+       because we drive vertical scroll via JS (enableInertialTouchScroll) rather
+       than native scroll — see the #terminal-wrap note for why native fling dies. */
+    .xterm .xterm-viewport { overflow-y: auto; touch-action: pan-x pinch-zoom; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
     @media (max-width: 640px) {
       #topbar { min-height: 38px; }
       #brand { font-size: 13px; }
@@ -133,12 +146,109 @@
       fontFamily: 'Cascadia Mono, Consolas, Menlo, Monaco, monospace',
       fontSize: window.innerWidth < 640 ? 13 : 14,
       theme: { background: '#05070a', foreground: '#d7e0ee', cursor: '#f8fafc', selectionBackground: '#334155' },
+      // Deep scrollback so the history the server replays on connect (see the
+      // 'replay' handler) isn't truncated — this is what a phone scrolls up into,
+      // since a browser client has no native console scrollback of its own.
+      scrollback: 10000,
       allowProposedApi: true
     });
     const fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
     term.open(document.getElementById('terminal'));
     term.focus();
+
+    // True when the viewport is pinned to the live bottom row. Used to guard the
+    // various scrollToBottom() calls so a user who has scrolled UP into history
+    // isn't yanked back down by the next resize / keyboard toggle / font refit.
+    function isAtBottom() {
+      try { const b = term.buffer.active; return b.viewportY >= b.baseY; }
+      catch (e) { return true; }
+    }
+    // --- Inertial touch scrolling (mobile) ---
+    // Native touch scroll is unusable here: xterm's Viewport snaps scrollTop to a
+    // whole-row boundary every scroll frame (Viewport.ts _innerRefresh), which
+    // cancels the browser's fling momentum the moment you lift off — a fast swipe
+    // "scrolls a bit then stops". So we forbid native pan-y (see CSS) and own the
+    // vertical gesture: track finger velocity, scroll by whole rows as pixels
+    // accumulate, and on release run a friction-decayed fling. Unlike the earlier
+    // per-move scrollLines(±1) (no inertia, fought the native scroller), this
+    // tracks 1:1 with the finger and coasts like a normal page. Horizontal panning
+    // and pinch-zoom stay native (touch-action: pan-x pinch-zoom).
+    (function enableInertialTouchScroll() {
+      if (!matchMedia('(pointer: coarse)').matches) return; // touch devices only
+      const surface = document.getElementById('terminal-wrap');
+      let rowH = 18;
+      function rowHeight() {
+        try {
+          const vp = document.querySelector('.xterm-viewport');
+          if (vp && term.rows > 0) { const h = vp.clientHeight / term.rows; if (h > 4) rowH = h; }
+        } catch (e) {}
+        return rowH;
+      }
+      // Physics matched to xterm.js/VS Code's own touch scroller (Monaco Gesture,
+      // ported to xterm src/browser/scrollable/touch.ts): release velocity is
+      // averaged over a rolling window of the last ~4 touch samples, and the fling
+      // decelerates LINEARLY at 0.005 px/ms^2 until it stops. (An exponential decay
+      // coasts differently and never truly halts.)
+      const FRICTION = 0.005; // px/ms^2, linear deceleration — the xterm constant
+      let active = false, decided = false, vertical = false;
+      let startX = 0, startY = 0, lastY = 0, accum = 0, raf = null;
+      const rY = [], rT = []; // rolling samples (clientY, timestamp) for velocity
+      function stopFling() { if (raf) { cancelAnimationFrame(raf); raf = null; } }
+      // Positive px => finger moved up => scroll toward newer lines (scrollLines +).
+      function applyPixels(px) {
+        accum += px;
+        const rh = rowHeight();
+        const rows = accum < 0 ? Math.ceil(accum / rh) : Math.floor(accum / rh);
+        if (rows !== 0) { accum -= rows * rh; term.scrollLines(rows); }
+      }
+      function atEdge(dir) { // dir>0 scrolling down/newer, dir<0 up/older
+        try { const b = term.buffer.active; return dir > 0 ? b.viewportY >= b.baseY : b.viewportY <= 0; }
+        catch (e) { return false; }
+      }
+      function sample(y, t) { rY.push(y); rT.push(t); if (rY.length > 4) { rY.shift(); rT.shift(); } }
+      surface.addEventListener('touchstart', (e) => {
+        if (e.touches.length !== 1) { active = false; return; } // let pinch through
+        stopFling();
+        active = true; decided = false; vertical = false;
+        const t = e.touches[0];
+        startX = t.clientX; startY = t.clientY; lastY = t.clientY;
+        accum = 0; rY.length = 0; rT.length = 0; sample(t.clientY, e.timeStamp);
+      }, { passive: true });
+      surface.addEventListener('touchmove', (e) => {
+        if (!active || e.touches.length !== 1) return;
+        const t = e.touches[0];
+        if (!decided) {
+          const dyT = startY - t.clientY, dxT = startX - t.clientX;
+          if (Math.abs(dyT) < 6 && Math.abs(dxT) < 6) return; // wait for a clear axis
+          decided = true; vertical = Math.abs(dyT) >= Math.abs(dxT);
+          if (!vertical) { active = false; return; } // horizontal → native pan-x
+        }
+        e.preventDefault(); // we own the vertical gesture (listener is non-passive)
+        applyPixels(lastY - t.clientY); // track the finger 1:1
+        lastY = t.clientY; sample(t.clientY, e.timeStamp);
+      }, { passive: false });
+      surface.addEventListener('touchend', (e) => {
+        if (!active || !vertical) { active = false; return; }
+        active = false;
+        // Release velocity over the rolling window, in scroll-space (finger up = +).
+        const dT = rT[rT.length - 1] - rT[0];
+        if (dT <= 0) return;
+        let v = (rY[0] - rY[rY.length - 1]) / dT;    // px/ms, signed
+        v = Math.max(-8, Math.min(8, v));            // sanity clamp
+        if (Math.abs(v) < 0.05) return;              // too slow to fling
+        let last = e.timeStamp;
+        const step = (now) => {
+          const dt = Math.max(1, now - last); last = now;
+          const dec = FRICTION * dt;                 // linear velocity bleed
+          v = v > 0 ? Math.max(0, v - dec) : Math.min(0, v + dec);
+          if (v === 0 || atEdge(v > 0 ? 1 : -1)) { raf = null; return; }
+          applyPixels(v * dt);
+          raf = requestAnimationFrame(step);
+        };
+        raf = requestAnimationFrame(step);
+      }, { passive: true });
+    })();
 
     let ws = null;
     let reconnectTimer = null;
@@ -275,6 +385,9 @@
       const wrap = document.getElementById('terminal-wrap');
       const h = wrap.clientHeight;
       if (h < 20) return;
+      // Only re-pin to the bottom if we were already there — don't yank a user
+      // who has scrolled up to read history.
+      const pinned = isAtBottom();
       // Fit the ROWS to the visible height so every row (incl. the prompt) shows;
       // width is allowed to overflow and pan horizontally, as before. 1.34 is a
       // conservative cell-height-per-font-px so it fits with a small margin.
@@ -285,11 +398,56 @@
         term.options.fontSize = fs;
         try { term.resize(lastEffCols, lastEffRows); } catch (e) {}
       }
-      try { term.scrollToBottom(); } catch (e) {}
+      if (pinned) { try { term.scrollToBottom(); } catch (e) {} }
     }
     function scheduleResize() {
       clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => { fitAndResize(); fitFontToGrid(); }, 80);
+      resizeTimer = setTimeout(() => {
+        // Don't refit while the user is scrolled up into history. On Android the
+        // address bar shows/hides as you scroll, which fires resize/visualViewport
+        // events; refitting the font here would resize the grid mid-scroll and make
+        // it jump and stutter. Defer the cosmetic refit until they're back at the
+        // live bottom. (A real ConPTY size change still applies immediately in the
+        // 'size' handler — that path is mandatory and independent of this one.)
+        if (!isAtBottom()) return;
+        fitAndResize(); fitFontToGrid();
+      }, 80);
+    }
+    // ---- History replay ----
+    // On attach the server sends one {type:'replay'} frame: base64(gzip(raw
+    // scrollback)). We decompress it and write the raw bytes into xterm at the
+    // ConPTY size the 'size' frame just set, so the reconstructed screen +
+    // scrollback matches the native terminal byte-for-byte. Decompression is async
+    // (DecompressionStream), so any live 'output' that arrives mid-decode is parked
+    // in pendingOutput and flushed IN ORDER once the history is written — otherwise
+    // new output could render above the history.
+    let replaying = false;
+    let pendingOutput = [];
+    function b64ToBytes(b64) {
+      const bin = atob(b64 || '');
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+    async function gunzip(bytes) {
+      const ds = new DecompressionStream('gzip');
+      const stream = new Blob([bytes]).stream().pipeThrough(ds);
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+    async function applyReplay(msg) {
+      const myWs = ws;                    // the socket this history belongs to
+      replaying = true;
+      try {
+        let bytes = b64ToBytes(msg.data);
+        if (msg.enc === 'gzip') bytes = await gunzip(bytes);
+        if (ws !== myWs) return;          // switched tab / reconnected mid-decode — drop it
+        if (bytes.length) term.write(bytes);
+      } catch (e) { /* if history can't be restored, live output still works */ }
+      if (ws !== myWs) return;
+      const q = pendingOutput; pendingOutput = [];
+      for (const d of q) term.write(d);   // flush live output that arrived mid-decode
+      replaying = false;
+      try { term.scrollToBottom(); } catch (e) {}
     }
     function connect() {
       clearTimeout(reconnectTimer);
@@ -297,11 +455,12 @@
       if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
       setStatus('connecting...');
       ws = new WebSocket(wsURL());
-      ws.onopen = () => { setStatus('connected'); lastReqCols = 0; lastReqRows = 0; lastEffCols = 0; lastEffRows = 0; fitAndResize(); term.focus(); };
+      ws.onopen = () => { setStatus('connected'); replaying = false; pendingOutput = []; lastReqCols = 0; lastReqRows = 0; lastEffCols = 0; lastEffRows = 0; fitAndResize(); term.focus(); };
       ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
-          if (msg.type === 'output') term.write(msg.data || '');
+          if (msg.type === 'output') { if (replaying) pendingOutput.push(msg.data || ''); else term.write(msg.data || ''); }
+          else if (msg.type === 'replay') { applyReplay(msg); }
           else if (msg.type === 'reset') {
             // Server dropped the raw replay; start from a clean slate and let the
             // app repaint the current frame. Reset trackers so we re-request.
@@ -314,6 +473,7 @@
             // cursor-relative deltas stay locked and don't drift over time.
             if (msg.cols && msg.rows && (msg.cols !== lastEffCols || msg.rows !== lastEffRows)) {
               const widthChanged = lastEffCols !== 0 && msg.cols !== lastEffCols;
+              const pinned = isAtBottom();
               term.resize(msg.cols, msg.rows);
               // A repainting TUI writes to the main screen, so old frames sit in
               // scrollback. On a WIDTH change xterm reflows that scrollback and
@@ -327,7 +487,9 @@
               // to the ConPTY/native-terminal size). On mobile, shrink the font so
               // it all fits; then keep the live bottom row — the prompt — in view.
               fitFontToGrid();
-              try { term.scrollToBottom(); } catch (e) {}
+              // widthChanged wipes scrollback (term.clear above) so we're at the
+              // bottom regardless; otherwise only re-pin if the user already was.
+              if (widthChanged || pinned) { try { term.scrollToBottom(); } catch (e) {} }
             }
           }
           else if (msg.type === 'sessions') { applySessions(msg.sessions || []); }
@@ -495,8 +657,9 @@
         document.body.style.height = vv.height + 'px';
         const covered = window.innerHeight - vv.height - vv.offsetTop;
         document.body.classList.toggle('osk-up', covered > 120);
+        const pinned = isAtBottom();
         scheduleResize();
-        try { term.scrollToBottom(); } catch (e) {}
+        if (pinned) { try { term.scrollToBottom(); } catch (e) {} }
       };
       vv.addEventListener('resize', apply);
       vv.addEventListener('scroll', apply);

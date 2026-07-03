@@ -1,6 +1,9 @@
 package main
 
-import "sync"
+import (
+	"bytes"
+	"sync"
+)
 
 type ringBuffer struct {
 	mu   sync.Mutex
@@ -30,6 +33,21 @@ func (r *ringBuffer) Bytes() []byte {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]byte(nil), r.data...)
+}
+
+// BytesFromLine returns a copy of the buffered bytes starting just after the
+// first newline. The ring drops from the front at an arbitrary byte boundary, so
+// its first line is usually a fragment; skipping to the first real line start
+// keeps a replayed snapshot from beginning mid-line (which would garble the top
+// row of reconstructed scrollback). Returns everything if there is no newline yet.
+func (r *ringBuffer) BytesFromLine() []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	data := r.data
+	if i := bytes.IndexByte(data, '\n'); i >= 0 && i+1 <= len(data) {
+		data = data[i+1:]
+	}
+	return append([]byte(nil), data...)
 }
 
 func (r *ringBuffer) Reset() {
