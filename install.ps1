@@ -90,11 +90,24 @@ try {
     }
 
     # --- install ---
-    # Stop a running moona so we can overwrite its exe.
-    Get-Process -Name moona -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Extract to a staging dir, then move only moona.exe into place. We never
+    # kill a running moona: on Windows a running .exe can't be overwritten, but
+    # it CAN be renamed, so an in-use moona.exe is moved aside to moona.exe.old
+    # (cleaned up on the next run) and the new binary takes its place.
+    $stage = Join-Path $tmp "extract"
+    Expand-Archive -Path $zip -DestinationPath $stage -Force
+    $src = Join-Path $stage "moona.exe"
+    if (-not (Test-Path $src)) { throw "archive did not contain moona.exe" }
+
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     Write-Info "installing to $InstallDir"
-    Expand-Archive -Path $zip -DestinationPath $InstallDir -Force
+    $dst = Join-Path $InstallDir "moona.exe"
+    if (Test-Path $dst) {
+        $old = "$dst.old"
+        Remove-Item $old -Force -ErrorAction SilentlyContinue
+        Move-Item -Path $dst -Destination $old -Force  # works even if moona is running
+    }
+    Move-Item -Path $src -Destination $dst -Force
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
