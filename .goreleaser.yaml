@@ -1,0 +1,59 @@
+# GoReleaser config for moona.
+# Cut a release by pushing a tag:  git tag v0.1.0 && git push origin v0.1.0
+# The GitHub Action (.github/workflows/release.yml) runs this on tag push.
+version: 2
+
+project_name: moona
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: moona
+    main: ./cmd/moona
+    binary: moona
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .ShortCommit }}
+      - -X main.date={{ .Date }}
+
+archives:
+  - id: moona
+    formats:
+      - zip
+    # Asset names encode os/arch so both the installer and the in-binary
+    # self-updater (creativeprojects/go-selfupdate) can pick the right one,
+    # e.g. moona_0.1.0_windows_amd64.zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - "Merge pull request"
+      - "Merge branch"
+
+release:
+  github:
+    owner: hoangvu12
+    name: moona
+  draft: false
+  # Tags like v0.1.0-rc1 publish as pre-releases automatically.
+  prerelease: auto

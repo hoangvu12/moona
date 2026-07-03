@@ -18,11 +18,47 @@ Windows Terminal -> moona attach -> moona.exe share -> Windows ConPTY -> pwsh/cl
 Phone browser --------------------------------------^ 
 ```
 
-## Build
+## Install
+
+Windows PowerShell one-liner (installs or upgrades):
+
+```powershell
+irm https://raw.githubusercontent.com/hoangvu12/moona/master/install.ps1 | iex
+```
+
+This downloads the latest release, verifies its SHA256 checksum, installs `moona.exe` to `%LOCALAPPDATA%\Programs\moona`, and adds it to your user PATH. Open a new terminal, then run `moona claude`.
+
+To pin a version, save the script and pass `-Version`:
+
+```powershell
+irm https://raw.githubusercontent.com/hoangvu12/moona/master/install.ps1 -OutFile install.ps1
+.\install.ps1 -Version v0.1.0
+```
+
+## Updating
+
+Moona keeps itself current. On startup it checks GitHub at most once per day and, if a newer release exists, verifies and installs it automatically, then relaunches — no admin rights needed (the binary lives in a user-writable folder).
+
+Update on demand, or just check:
+
+```powershell
+moona update
+moona update --check
+```
+
+Opt out of the automatic startup check:
+
+```powershell
+$env:MOONA_NO_UPDATE = "1"
+```
+
+## Build from source
 
 ```powershell
 go build -o moona.exe ./cmd/moona
 ```
+
+A plain `go build` produces a `dev` build, which disables the self-updater. Released binaries are built by [GoReleaser](https://goreleaser.com) via GitHub Actions on every `v*` tag.
 
 ## Use locally
 

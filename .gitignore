@@ -9,3 +9,6 @@ moona.exe~
 
 # Tool caches
 .mimir/
+
+# GoReleaser output
+dist/

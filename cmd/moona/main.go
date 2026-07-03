@@ -20,20 +20,25 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
+		maybeAutoUpdate(args)
 		return runShare(args)
 	}
 	switch args[0] {
 	case "share", "serve":
+		maybeAutoUpdate(args)
 		return runShare(args[1:])
 	case "attach":
 		return runAttach(args[1:])
+	case "update", "upgrade", "self-update":
+		return runUpdate(args[1:])
 	case "help", "-h", "--help":
 		printHelp()
 		return nil
-	case "version", "--version":
-		fmt.Println("moona dev")
+	case "version", "--version", "-v":
+		printVersion()
 		return nil
 	default:
+		maybeAutoUpdate(args)
 		return runShortcut(args)
 	}
 }
@@ -48,6 +53,8 @@ Usage:
   moona share -- codex
   moona share --cmd "pwsh.exe"
   moona attach [flags]
+  moona update [--check]           update to the latest release (auto on startup)
+  moona version
 
 Attach flags:
   --url string     moona share URL to attach to (default http://127.0.0.1:8787)
