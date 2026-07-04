@@ -1,0 +1,30 @@
+# Live-reload dev loop for the moona daemon (Tier 2).
+#
+# On any .go change, Air rebuilds ./cmd/moona and restarts the SANDBOX daemon on
+# port 8899 with the isolated .testhome state dir -- it NEVER touches the real
+# :8787 daemon that may be hosting your Claude Code session. UI edits
+# (web/index.html) do NOT rebuild here; they hot-reload in the browser via
+# MOONA_DEV (Tier 1), so a CSS tweak never pays for a Go compile.
+#
+# Launch through dev.ps1 (it sets LOCALAPPDATA=.testhome + MOONA_DEV so the
+# sandbox and UI hot-reload are wired up). One-time install:
+#   go install github.com/air-verse/air@latest
+root    = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd           = "go build -o ./tmp/moona.exe ./cmd/moona"
+  bin           = "./tmp/moona.exe"
+  args_bin      = ["daemon", "--port", "8899", "--tunnel=false", "--qr=false"]
+  include_ext   = ["go"]
+  exclude_dir   = [".testhome", "tmp", "testdata", "dist", ".git"]
+  exclude_regex = ["_test.go"]
+  delay         = 400
+  # On Windows Air hard-kills the old daemon (send_interrupt is Unix-only); the
+  # sandbox sessions are disposable, and the wait lets :8899 free up before the
+  # rebuilt daemon rebinds it.
+  kill_delay    = "800ms"
+  stop_on_error = true
+
+[misc]
+  clean_on_exit = false

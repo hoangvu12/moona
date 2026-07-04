@@ -348,6 +348,15 @@ func startDaemonServer(opts daemonOptions) (*daemon, error) {
 		}
 		d.errc <- nil
 	}()
+	// In dev mode, auto-reload connected browsers when web/index.html changes,
+	// and (optionally) seed a session so a phone/dev tab reconnects to a live
+	// terminal after each rebuild-restart instead of an empty daemon.
+	if devMode() {
+		go d.watchWebReload()
+		if seed := strings.TrimSpace(os.Getenv("MOONA_DEV_SEED")); seed != "" {
+			go d.seedDevSession(seed)
+		}
+	}
 	return d, nil
 }
 

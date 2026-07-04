@@ -11,6 +11,9 @@ moona.exe~
 # Tool caches
 .mimir/
 
+# Air live-reload build output (dev.ps1 / .air.toml)
+tmp/
+
 # Isolated test home (moona setup/daemon state during local testing)
 .testhome/
 

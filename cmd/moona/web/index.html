@@ -535,6 +535,7 @@
           else if (msg.type === 'sessions') { applySessions(msg.sessions || []); }
           else if (msg.type === 'status') { setStatus(msg.message || 'connected'); if ((msg.message || '').indexOf('exited') >= 0) refreshSessions(); }
           else if (msg.type === 'error') { setStatus(msg.message || 'error'); term.writeln('\r\n[moona] ' + (msg.message || 'error')); }
+          else if (msg.type === 'reload') { location.reload(); }  // dev: web/index.html changed on disk
         } catch (e) {}
       };
       ws.onclose = () => { setStatus('disconnected; reconnecting...'); reconnectTimer = setTimeout(connect, 1200); };

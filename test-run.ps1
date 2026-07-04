@@ -29,6 +29,10 @@ New-Item -ItemType Directory -Force -Path $sandbox | Out-Null
 # Isolate ALL moona state (daemon.json, config.json, cloudflared/ngrok cache, logs).
 $env:LOCALAPPDATA = $sandbox
 $env:MOONA_NO_UPDATE = '1'
+# Serve web/index.html from disk + auto-reload the browser on save (UI hot-reload).
+# Absolute path so it resolves even in the auto-spawned detached daemon.
+$env:MOONA_DEV = '1'
+$env:MOONA_DEV_WEB = Join-Path $root 'cmd\moona\web\index.html'
 
 $sub  = if ($Rest.Count -gt 0) { $Rest[0] } else { '' }
 $tail = if ($Rest.Count -gt 1) { $Rest[1..($Rest.Count - 1)] } else { @() }
