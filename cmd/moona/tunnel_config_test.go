@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"regexp"
 	"testing"
 )
@@ -38,6 +39,17 @@ func TestLineHasReadyMarker(t *testing.T) {
 	}
 	if lineHasReadyMarker("anything", nil) {
 		t.Error("no markers should never match")
+	}
+}
+
+func TestCloudflaredCredsPath(t *testing.T) {
+	t.Setenv("TUNNEL_ORIGIN_CERT", filepath.Join("some", "dir", "cert.pem"))
+	want := filepath.Join("some", "dir", "d845e7ea.json")
+	if got := cloudflaredCredsPath("d845e7ea"); got != want {
+		t.Errorf("cloudflaredCredsPath = %q, want %q", got, want)
+	}
+	if got := cloudflaredCredsPath(""); got != "" {
+		t.Errorf("empty tunnel id should give empty path, got %q", got)
 	}
 }
 

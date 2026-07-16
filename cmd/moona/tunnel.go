@@ -126,10 +126,22 @@ func ngrokProvider(port int, uc userConfig) tunnelProvider {
 func cloudflareNamedProvider(port int, uc userConfig) tunnelProvider {
 	host := strings.TrimPrefix(strings.TrimPrefix(uc.CFHostname, "https://"), "http://")
 	return tunnelProvider{
-		name:     "Cloudflare named tunnel",
-		binary:   "cloudflared",
-		prepare:  ensureCloudflared,
-		args:     []string{"tunnel", "--url", fmt.Sprintf("http://127.0.0.1:%d", port), "run", uc.CFTunnel},
+		name:   "Cloudflare named tunnel",
+		binary: "cloudflared",
+		// Beyond the binary, `tunnel run` needs the tunnel's local credentials file;
+		// regenerate it when missing (wiped ~/.cloudflared, tunnel created on another
+		// machine) instead of letting run crash-loop on "credentials file not found".
+		prepare: func() (string, error) {
+			bin, err := ensureCloudflared()
+			if err != nil {
+				return "", err
+			}
+			if err := ensureCloudflareCreds(bin, uc.CFTunnel); err != nil {
+				return "", err
+			}
+			return bin, nil
+		},
+		args: []string{"tunnel", "--url", fmt.Sprintf("http://127.0.0.1:%d", port), "run", uc.CFTunnel},
 		fixedURL: "https://" + host,
 		// cloudflared logs one of these once an edge connection is actually live.
 		readyMarkers: []string{"registered tunnel connection", "connection registered"},

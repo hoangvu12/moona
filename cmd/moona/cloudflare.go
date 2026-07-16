@@ -65,18 +65,59 @@ func cloudflaredListTunnels(bin string) ([]cfTunnelInfo, error) {
 }
 
 // cloudflaredFindTunnel returns the UUID of an existing tunnel with the given
-// name, or "" if none exists.
-func cloudflaredFindTunnel(bin, name string) (string, error) {
+// name (or UUID — config may store either), or "" if none exists.
+func cloudflaredFindTunnel(bin, nameOrID string) (string, error) {
 	tunnels, err := cloudflaredListTunnels(bin)
 	if err != nil {
 		return "", err
 	}
 	for _, t := range tunnels {
-		if strings.EqualFold(t.Name, name) {
+		if strings.EqualFold(t.Name, nameOrID) || strings.EqualFold(t.ID, nameOrID) {
 			return t.ID, nil
 		}
 	}
 	return "", nil
+}
+
+// cloudflaredCredsPath is where cloudflared expects a named tunnel's credentials
+// file: <tunnel-id>.json in the same directory as the account certificate.
+func cloudflaredCredsPath(id string) string {
+	certPath := cloudflaredCertPath()
+	if certPath == "" || id == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(certPath), id+".json")
+}
+
+// ensureCloudflareCreds makes sure the tunnel's local credentials file exists,
+// regenerating it from the Cloudflare account when missing. Only `cloudflared
+// tunnel create` writes that file, so a tunnel created on another machine — or a
+// wiped ~/.cloudflared — leaves `tunnel run` failing forever with "tunnel
+// credentials file not found". With the account cert present, the file can be
+// minted again via `cloudflared tunnel token --cred-file`.
+func ensureCloudflareCreds(bin, tunnel string) error {
+	if !cloudflaredLoggedIn() {
+		return errors.New("Cloudflare isn't authorized on this machine (no cert.pem) — run `moona setup` to re-authorize")
+	}
+	id, err := cloudflaredFindTunnel(bin, tunnel)
+	if err != nil || id == "" {
+		// Listing can fail transiently (network); a missing tunnel is a config
+		// problem `tunnel run` reports clearly itself. Neither is the stranded-
+		// credentials case this fixes, so let the run proceed and speak for itself.
+		return nil
+	}
+	credsPath := cloudflaredCredsPath(id)
+	if credsPath == "" {
+		return nil
+	}
+	if fi, err := os.Stat(credsPath); err == nil && !fi.IsDir() {
+		return nil
+	}
+	terminalPrintln(os.Stderr, "tunnel credentials file missing; regenerating from your Cloudflare account...")
+	if out, err := exec.Command(bin, "tunnel", "token", "--cred-file", credsPath, id).CombinedOutput(); err != nil {
+		return fmt.Errorf("regenerate tunnel credentials: %s — run `moona setup` to re-authorize Cloudflare", firstLine(out))
+	}
+	return nil
 }
 
 // provisionCloudflare makes a named tunnel ready end-to-end: authorize (browser,
@@ -125,6 +166,11 @@ func provisionCloudflare(cfg *userConfig) error {
 		}
 	} else {
 		fmt.Printf("• Reusing existing tunnel %q.\n", cfg.CFTunnel)
+		// A tunnel created on another machine (or a wiped ~/.cloudflared) has no
+		// local credentials file, which `tunnel run` needs; regenerate it now.
+		if err := ensureCloudflareCreds(bin, cfg.CFTunnel); err != nil {
+			return err
+		}
 	}
 
 	// 3. Point the hostname at the tunnel (idempotent: an existing record is fine).
