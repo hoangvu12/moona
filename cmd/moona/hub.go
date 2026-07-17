@@ -130,6 +130,49 @@ func (h *hub) remove(id string) {
 	}
 }
 
+// touch refreshes the idle clock of every named session that still exists, so an
+// open browser page keeps the tabs it is showing (including the ones it is not
+// currently viewing, which have no socket) from being reaped. Unknown ids — tabs
+// for sessions that already ended — are ignored.
+func (h *hub) touch(ids []string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, id := range ids {
+		if s := h.sessions[id]; s != nil {
+			s.markSeen()
+		}
+	}
+}
+
+// reapIdle closes every session that has had no client and no keepalive for at
+// least grace, dropping them from the registry, and returns their ids for logging.
+// This is what makes a tab with no active client disappear on its own instead of
+// lingering forever. It mirrors remove()'s bookkeeping (lastEmpty + onChange) so a
+// reap that empties the daemon still arms idle-exit and refreshes browser tab bars.
+func (h *hub) reapIdle(grace time.Duration) []string {
+	h.mu.Lock()
+	var doomed []*session
+	var ids []string
+	for id, s := range h.sessions {
+		if s.reapable(grace) {
+			doomed = append(doomed, s)
+			ids = append(ids, id)
+			delete(h.sessions, id)
+		}
+	}
+	if len(doomed) > 0 && len(h.sessions) == 0 {
+		h.lastEmpty = time.Now()
+	}
+	h.mu.Unlock()
+	for _, s := range doomed {
+		s.close()
+	}
+	if len(doomed) > 0 {
+		h.notifyChange()
+	}
+	return ids
+}
+
 // broadcast queues msg to every client across every session. Used to push the
 // session list to all connected browsers on any change.
 func (h *hub) broadcast(msg []byte) {

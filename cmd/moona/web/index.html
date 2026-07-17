@@ -307,6 +307,9 @@
         else { activeId = null; if (ws) { try { ws.close(); } catch (e) {} ws = null; } setStatus('no sessions — tap ＋ to start one'); }
       }
       renderTabs();
+      // Protect every tab we now show (including ones started elsewhere that just
+      // appeared) from the idle reaper right away, not only on the next interval.
+      sendKeepalive();
     }
     async function refreshSessions() {
       try {
@@ -489,13 +492,23 @@
       send({ type: 'active', active: document.visibilityState === 'visible' });
     }
     document.addEventListener('visibilitychange', sendActive);
+    // Tell the daemon which sessions this page still has open as tabs, so the ones
+    // we're NOT currently viewing (they have no socket of their own) aren't reaped
+    // as abandoned while this page stays open. The daemon closes a session only
+    // after it has had no client AND no keepalive for its grace window, so a page
+    // left open here keeps all its tabs alive; closing the page lets them be reaped.
+    function sendKeepalive() {
+      if (!sessions.length) return;
+      send({ type: 'keepalive', keepalive: sessions.map(s => s.id) });
+    }
+    setInterval(sendKeepalive, 30000);
     function connect() {
       clearTimeout(reconnectTimer);
       if (!activeId) { setStatus('no sessions — run "moona claude"'); return; }
       if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
       setStatus('connecting...');
       ws = new WebSocket(wsURL());
-      ws.onopen = () => { setStatus('connected'); replaying = false; pendingOutput = []; lastReqCols = 0; lastReqRows = 0; lastEffCols = 0; lastEffRows = 0; fitAndResize(); sendActive(); term.focus(); };
+      ws.onopen = () => { setStatus('connected'); replaying = false; pendingOutput = []; lastReqCols = 0; lastReqRows = 0; lastEffCols = 0; lastEffRows = 0; fitAndResize(); sendActive(); sendKeepalive(); term.focus(); };
       ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);

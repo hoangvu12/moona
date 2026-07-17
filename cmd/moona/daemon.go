@@ -28,6 +28,18 @@ import (
 // so the QR/dashboard stays up as long as you want it.
 const idleTimeout = 15 * time.Minute
 
+// sessionIdleTimeout is how long a session may have no attached client — and no
+// keepalive from a browser page that still shows it as a tab — before the reaper
+// closes it. This is what stops a detached terminal (or a phone-started session
+// nobody reopened) from lingering forever. A browser you still have open protects
+// its tabs by sending keepalives, so only genuinely-abandoned sessions are reaped;
+// after detaching a terminal you have this long to `moona attach` back onto it.
+const sessionIdleTimeout = 2 * time.Minute
+
+// sessionReapInterval is how often the reaper checks for idle sessions. Well under
+// sessionIdleTimeout so a session dies within a reap tick of crossing the grace.
+const sessionReapInterval = 20 * time.Second
+
 // daemonOptions configure the switchboard process.
 type daemonOptions struct {
 	host   string
@@ -277,6 +289,7 @@ func runDaemon(args []string) error {
 	if opts.auto {
 		go d.watchIdle()
 	}
+	go d.watchIdleSessions()
 	go d.watchSignals()
 
 	return <-d.errc
@@ -467,6 +480,22 @@ func (d *daemon) watchIdle() {
 	}
 }
 
+// watchIdleSessions periodically closes sessions that have had no attached client
+// and no browser keepalive for sessionIdleTimeout, so tabs with no active client
+// disappear on their own instead of lingering. Runs for the daemon's whole life
+// (both auto-started and manual `moona daemon`); it never shuts the daemon down —
+// idle-exit is watchIdle's job, which this feeds by letting the session count reach
+// zero.
+func (d *daemon) watchIdleSessions() {
+	ticker := time.NewTicker(sessionReapInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		for _, id := range d.hub.reapIdle(sessionIdleTimeout) {
+			log.Printf("session %s had no client for %s; closing it", id, sessionIdleTimeout)
+		}
+	}
+}
+
 func (d *daemon) watchSignals() {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, os.Interrupt)
@@ -535,7 +564,7 @@ func (d *daemon) handleWS(w http.ResponseWriter, r *http.Request) {
 	// Make the running program redraw its current frame so this freshly attached
 	// (and reset) client shows a clean screen instead of nothing.
 	sess.forceRepaint()
-	readPump(sess, c)
+	readPump(d.hub, sess, c)
 	sess.detach(c)
 	_ = conn.Close()
 }

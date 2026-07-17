@@ -92,7 +92,10 @@ How it works:
   daemon auto-starts on first use and idle-exits when nothing is connected. Run
   'moona daemon' yourself in a spare tab if you want the QR to stay on screen.
   Sessions live in the daemon, so closing a terminal does not kill its session;
-  reconnect with 'moona attach <id>'. The phone sees all sessions as tabs.
+  reconnect with 'moona attach <id>'. The phone sees all sessions as tabs. A
+  session with no attached terminal and no open tab is closed after a couple of
+  minutes, so abandoned terminals don't pile up; a page you keep open protects
+  its tabs.
 
 Daemon flags:
   --host string    host/interface to bind (default 127.0.0.1)

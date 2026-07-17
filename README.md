@@ -15,7 +15,7 @@ Windows Terminal (moona claude / moona attach) ---^  (same sessions, locally)
 
 You start work the way you normally would, with `moona claude`, and it opens right away. Behind the scenes it asks the daemon to spawn the session and attaches your current terminal to it. The QR code and link live in the daemon rather than competing with your TUI for the screen, so there is no "press Enter to continue" step.
 
-Sessions live in the daemon, so closing a terminal does not kill its session. Reconnect from any tab with `moona attach <id>`, and your phone stays connected the whole time.
+Sessions live in the daemon, so closing a terminal does not kill its session. Reconnect from any tab with `moona attach <id>`, and your phone stays connected the whole time. A session only goes away once nothing is using it: when it has had no attached terminal and no open phone/browser tab for a couple of minutes, the daemon closes it on its own so abandoned terminals don't pile up. A page you still have open keeps all of its tabs alive, so this only reaps sessions you have genuinely walked away from.
 
 ## Install
 

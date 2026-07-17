@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -42,6 +43,12 @@ type wsMessage struct {
 	// Sessions carries the daemon's current session list on a {type:"sessions"}
 	// frame, so browsers refresh their tab bar from a push instead of polling.
 	Sessions []sessionInfo `json:"sessions,omitempty"`
+	// KeepAlive carries the session ids a browser page currently shows as tabs, on a
+	// {type:"keepalive"} frame it sends periodically over its one active socket. The
+	// daemon refreshes those sessions' idle clocks so background tabs (which have no
+	// socket of their own) survive as long as a page that lists them is open. See
+	// hub.touch / the idle-session reaper.
+	KeepAlive []string `json:"keepalive,omitempty"`
 }
 
 type client struct {
@@ -97,6 +104,14 @@ type session struct {
 	closed  bool
 	clients map[*client]struct{}
 	buffer  *ringBuffer
+	// lastSeen is when this session last had a reason to stay alive with no client
+	// attached: the moment its last client detached, or the last keepalive from a
+	// browser page that still lists it as a tab. The idle-session reaper closes a
+	// session that has had zero clients AND no keepalive for longer than the grace
+	// window (see reapable / hub.reapIdle). Seeded to creation time so the brief
+	// gap between spawning a session and its launching terminal attaching does not
+	// count as abandonment. Guarded by mu.
+	lastSeen time.Time
 	// Effective (smallest-client) size last applied to the ConPTY. Broadcast to
 	// clients so a larger client can clear ghost output when the shared render
 	// width changes because another client joined or left.
@@ -106,11 +121,36 @@ type session struct {
 
 func newSession(cfg config) *session {
 	return &session{
-		cfg:     cfg,
-		command: cfg.commandLine,
-		clients: make(map[*client]struct{}),
-		buffer:  newRingBuffer(sessionBufferBytes),
+		cfg:      cfg,
+		command:  cfg.commandLine,
+		clients:  make(map[*client]struct{}),
+		buffer:   newRingBuffer(sessionBufferBytes),
+		lastSeen: time.Now(),
 	}
+}
+
+// markSeen refreshes the idle clock so the reaper leaves this session alone for
+// another grace window. Called when a browser page that still shows this session
+// as a tab sends a keepalive — a background tab has no socket of its own, so this
+// is how an open page keeps the tabs it isn't currently viewing from being reaped.
+func (s *session) markSeen() {
+	s.mu.Lock()
+	s.lastSeen = time.Now()
+	s.mu.Unlock()
+}
+
+// reapable reports whether the idle-session reaper should close this session: it
+// has no attached client and has not been seen (last client left / last keepalive)
+// for at least grace. A session with any client — a native terminal or the browser
+// tab currently being viewed — is never reapable. Already-closed sessions report
+// false so a concurrent reap and process-exit don't double-close.
+func (s *session) reapable(grace time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || len(s.clients) > 0 {
+		return false
+	}
+	return time.Since(s.lastSeen) >= grace
 }
 
 func (s *session) ensureStarted() error {
@@ -198,6 +238,10 @@ func replayFrame(raw []byte) []byte {
 func (s *session) detach(c *client) {
 	s.mu.Lock()
 	delete(s.clients, c)
+	// Start (or refresh) the idle clock: with this client gone the session may now
+	// have none, and the reaper measures abandonment from here. Harmless when other
+	// clients remain — reapable checks for those before ever consulting lastSeen.
+	s.lastSeen = time.Now()
 	pty := s.pty
 	running := s.running
 	cols, rows := s.minClientSizeLocked()
